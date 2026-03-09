@@ -1,7 +1,8 @@
 # java-microservices-ecommerce-system
--- ./runme.sh -c  --> compiles code. 
--- ./runme.sh -u  --> starts the User service
--- ./runme.sh -p  --> starts the Product service
--- ./runme.sh -i  --> starts the ISCS
--- ./runme.sh -o  --> starts the Order service
--- ./runme.sh -w workloadfile --> starts the workload parser on the same machine as the order service
+
+- `./runme.sh -c` → compiles code  
+- `./runme.sh -u` → starts the User service  
+- `./runme.sh -p` → starts the Product service  
+- `./runme.sh -i` → starts the ISCS  
+- `./runme.sh -o` → starts the Order service  
+- `./runme.sh -w workloadfile` → starts the workload parser on the same machine as the order service
