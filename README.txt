@@ -1,4 +1,3 @@
-# java-microservices-ecommerce-system
 -- ./runme.sh -c  --> compiles code. 
 -- ./runme.sh -u  --> starts the User service
 -- ./runme.sh -p  --> starts the Product service

@@ -1,0 +1,12 @@
+# compiled files
+compiled/
+*.class
+
+# tests
+tests/
+
+# docs
+docs/
+
+# mac files
+.DS_Store
