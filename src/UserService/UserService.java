@@ -2,47 +2,37 @@ import com.sun.net.httpserver.HttpServer;
 import com.sun.net.httpserver.HttpHandler;
 import com.sun.net.httpserver.HttpExchange;
 
-import java.io.BufferedReader;
 import java.io.IOException;
-import java.io.InputStreamReader;
-import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Paths;
 import java.security.MessageDigest;
 import java.sql.Connection;
-import java.util.HashMap;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
-import java.io.File;
-import java.io.FileNotFoundException;
-import java.util.Scanner; 
-import java.io.FileWriter;
-import java.sql.Connection;
-import java.sql.DriverManager;
 import java.sql.ResultSet;
+import java.sql.SQLException;
+import common.HttpResponse;
+import common.ConfigUtils;
+import common.DbUtils;
+import common.HttpUtils;
 
 public class UserService {
-    // data base
-    static Map<Integer, User> db = new ConcurrentHashMap<>();
     static HttpServer server;
     final static String dbPath = "src/db/user.db";
-    static String configFileName;
     static String dbIp;
     static int dbPort;
     static String dbName = "ecommerce";
     static String dbPassword = "password";
 
     public static void main(String[] args) throws IOException {
-        loadUsers(dbPath);
-        configFileName = args[0];
-        int port = getPort("UserService", configFileName);
-        dbIp = getIp("Database", configFileName);
-        dbPort = getPort("Database", configFileName);
+        // loadUsers(dbPath);
+        String configFileName = ConfigUtils.loadConfigFile(args[0]);
+        dbIp = ConfigUtils.getIp("Database", configFileName);
+        dbPort = ConfigUtils.getPort("Database", configFileName);
+
+        int port = ConfigUtils.getPort("UserService", configFileName);
         server = HttpServer.create(new InetSocketAddress(port), 0);
-        server.setExecutor(Executors.newFixedThreadPool(20)); // Adjust the pool size as needed
+        server.setExecutor(Executors.newFixedThreadPool(512)); // Adjust the pool size as needed
         server.createContext("/user", new UserPostHandler());
         server.createContext("/user/", new UserGetHandler());
         server.createContext("/shutdown", new ShutdownHandler());
@@ -62,37 +52,27 @@ public class UserService {
         }   
     }
 
-    static class Result {
-        int status;
-        String body;
-
-        Result(int status, String body) {
-            this.status = status;
-            this.body = body;
-        }
-    }
-
     static class UserPostHandler implements HttpHandler {
         @Override
         public void handle(HttpExchange exchange) throws IOException {
             // non-POST requests
             if (!"POST".equals(exchange.getRequestMethod())) {
-                sendJsonResponse(exchange, 404, "{}");
+                HttpUtils.sendJsonResponse(exchange, 404, "{}");
                 return;
             }
 
             // check if content type is json
             String contentType = exchange.getRequestHeaders().getFirst("Content-Type");
             if (contentType == null || !contentType.equals("application/json")) {
-                sendJsonResponse(exchange, 400, "{}");
+                HttpUtils.sendJsonResponse(exchange, 400, "{}");
                 return;
             }
 
             // check if body is valid json
-            String body = getRequestBody(exchange);
-            Map<String, String> json = stringToJSON(body);
+            String body = HttpUtils.getRequestBody(exchange);
+            Map<String, String> json = HttpUtils.stringToJSON(body);
             if (json == null) {
-                sendJsonResponse(exchange, 400, "{}");
+                HttpUtils.sendJsonResponse(exchange, 400, "{}");
                 return;                 
             }
 
@@ -100,13 +80,13 @@ public class UserService {
             String command = json.get("command");
             User userData = jsonToUser(json);
             if (userData == null) {
-                sendJsonResponse(exchange, 400, "{}");
+                HttpUtils.sendJsonResponse(exchange, 400, "{}");
                 return;
             }
 
             // process user command and send response
-            Result result = userCommand(command, userData);
-            sendJsonResponse(exchange, result.status, result.body);
+            HttpResponse response = userCommand(command, userData);
+            HttpUtils.sendJsonResponse(exchange, response.status, response.body);
         }
     }
 
@@ -115,7 +95,7 @@ public class UserService {
         public void handle(HttpExchange exchange) throws IOException {
             // non-GET requests
             if (!"GET".equals(exchange.getRequestMethod())) {
-                sendJsonResponse(exchange, 404, "{}");
+                HttpUtils.sendJsonResponse(exchange, 404, "{}");
                 return;
             }
 
@@ -125,100 +105,56 @@ public class UserService {
             try {
                 id = Integer.parseInt(tokens[2]);
             } catch (NumberFormatException e) {
-                sendJsonResponse(exchange, 400, "{}");
+                HttpUtils.sendJsonResponse(exchange, 400, "{}");
                 return;
             }
 
             // send response json
-            User user = db.get(id);
-            if (user == null) {
-                sendJsonResponse(exchange, 404, "{}");
-                return;
-            }
-            sendJsonResponse(exchange, 200, userToJson(user));
+            HttpResponse response = getUser(id);
+            HttpUtils.sendJsonResponse(exchange, response.status, response.body);
         }
     }
 
     static class ShutdownHandler implements HttpHandler {
         @Override
         public void handle(HttpExchange exchange) throws IOException {
-            if ("POST".equals(exchange.getRequestMethod())) {
-                storeUsers(dbPath);
-                exchange.getResponseHeaders().set("Content-Type", "application/json");
-                exchange.sendResponseHeaders(200, 0);
-                sendResponse(exchange, "{}");
-                exchange.close();
-                server.stop(0);
-                System.exit(0);               
-            } else {
-                // Send a 405 Method Not Allowed response for non-POST requests
-                exchange.getResponseHeaders().set("Content-Type", "application/json");
-                exchange.sendResponseHeaders(404, 0);
-                sendResponse(exchange, "{}");
-                exchange.close();
+            // non-POST requests
+            if (!"POST".equals(exchange.getRequestMethod())) {
+                HttpUtils.sendJsonResponse(exchange, 404, "{}");
                 return;
             }
-            
+            // storeUsers(dbPath);
+            HttpUtils.sendJsonResponse(exchange, 200, "{}");
+            server.stop(0);
+            System.exit(0);               
         }
     }
 
     static class WipeHandler implements HttpHandler {
         @Override
         public void handle(HttpExchange exchange) throws IOException {
-            if ("POST".equals(exchange.getRequestMethod())) {
-                wipeDB(dbPath);
-                db.clear();
-                exchange.getResponseHeaders().set("Content-Type", "application/json");
-                exchange.sendResponseHeaders(200, 0);
-                sendResponse(exchange, "{}");
-                exchange.close();             
-            } else {
-                // Send a 405 Method Not Allowed response for non-POST requests
-                exchange.getResponseHeaders().set("Content-Type", "application/json");
-                exchange.sendResponseHeaders(404, 0);
-                sendResponse(exchange, "{}");
-                exchange.close();
+            // non-POST requests
+            if (!"POST".equals(exchange.getRequestMethod())) {
+                HttpUtils.sendJsonResponse(exchange, 404, "{}");
                 return;
             }
-            
+            // wipeDB(dbPath);
+            // db.clear();
+            HttpUtils.sendJsonResponse(exchange, 200, "{}");
         }
     }
 
-    private static Result userCommand(String command, User userData) {
-        int status;
+    private static HttpResponse userCommand(String command, User userData) {
         if ("create".equals(command)) {
-            status = createUser(userData);
-            if (status == 200) {
-                return new Result(status, userToJson(db.get(userData.id)));
-            } else {
-                return new Result(status, "{}");
-            }
-
+            return createUser(userData);
         } else if ("update".equals(command)) {
-            status = updateUser(userData);
-            if (status == 200) {
-                return new Result(status, userToJson(db.get(userData.id)));
-            } else {
-                return new Result(status, "{}");
-            }
+            return updateUser(userData);
         } else if ("delete".equals(command)) {
-            status = deleteUser(userData);
-            return new Result(status, "{}");
+            return deleteUser(userData);
         }
-        
-        // service not found
-        return new Result(404, "{}");
-    }
 
-    private static String getRequestBody(HttpExchange exchange) throws IOException {
-        try (BufferedReader br = new BufferedReader(new InputStreamReader(exchange.getRequestBody(), StandardCharsets.UTF_8))) {
-            StringBuilder requestBody = new StringBuilder();
-            String line;
-            while ((line = br.readLine()) != null) {
-                requestBody.append(line);
-            }
-            return requestBody.toString();
-        }
+        // service not found
+        return new HttpResponse(404, "{}");
     }
 
     private static User jsonToUser(Map<String, String> json) {
@@ -244,75 +180,181 @@ public class UserService {
         return user;
     }
 
+    private static HttpResponse getUser(int id) {
+        String sql = "SELECT id, username, email, password FROM users WHERE id = ?";
+        try (Connection dbConnection = DbUtils.getDBConnection(dbIp, dbPort, dbName, dbPassword);
+            var statement = dbConnection.prepareStatement(sql)) {
+            statement.setInt(1, id);
 
-    private static Integer createUser(User userData) {
-        if (db.get(userData.id) != null) {
-            return 409;
+            try (ResultSet result = statement.executeQuery()) {
+                if (result.next()) {
+                    return new HttpResponse(200, getUserJsonBuilder(result));
+                } else {
+                    return new HttpResponse(404, "{}");
+                }
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
         }
-        if (userData.username == null || userData.email == null || userData.password == null) {
-            return 400;
-        }
-        if (userData.username.equals("") || userData.email.equals("") || userData.password.equals(sha256(""))) {
-            return 400;
-        }    
-        if (!validEmail(userData.email)) {
-            return 400;
-        }        
-        db.put(userData.id, userData);
-        return 200;
+        return new HttpResponse(500, "{}");
     }
 
-    private static Integer updateUser(User userData) {
-        User user = db.get(userData.id);
+    private static String getUserJsonBuilder(ResultSet result) throws SQLException{
+        StringBuilder json = new StringBuilder();
+        json.append("{");
+        json.append("\"id\":").append(result.getInt("id")).append(",");
+        json.append("\"username\":\"").append(result.getString("username")).append("\",");
+        json.append("\"email\":\"").append(result.getString("email")).append("\",");
+        json.append("\"password\":\"").append(result.getString("password").toUpperCase()).append("\"");
+        json.append("}");
+        return json.toString();
+    }
 
-        // check if user exists
-        if (user == null) {
-            return 404;
+
+    private static HttpResponse createUser(User userData) {
+        if (checkUserExistence(userData.id)) {
+            return new HttpResponse(409, "{}");
+        }
+        if (userData.username == null || userData.email == null || userData.password == null) {
+            return new HttpResponse(400, "{}");
+        }
+        if (userData.username.equals("") || userData.email.equals("") || userData.password.equals(sha256(""))) {
+            return new HttpResponse(400, "{}");
+        }    
+        if (!validEmail(userData.email)) {
+            return new HttpResponse(400, "{}");
+        }        
+        insertUser(userData);
+        return new HttpResponse(200, userToJson(userData));
+    }
+
+    private static boolean checkUserExistence(int id) {
+        String sql = "SELECT 1 FROM users WHERE id = ? LIMIT 1";
+        try (Connection dbConnection = DbUtils.getDBConnection(dbIp, dbPort, dbName, dbPassword);
+            var statement = dbConnection.prepareStatement(sql)) {
+            statement.setInt(1, id);
+
+            try (ResultSet result = statement.executeQuery()) {
+                return result.next();
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+        }    
+        return false;
+    }
+
+    private static HttpResponse updateUser(User userData) {
+        // check user existence
+        if (!checkUserExistence(userData.id)) {
+            return new HttpResponse(404, "{}");
         }
 
-        // update userdata
+        // build update command 
+        StringBuilder sql = new StringBuilder("UPDATE users SET ");
+        boolean usernameExist=false, emailExist=false, passwordExist=false;
+        boolean first = true;
         if (userData.username != null) {
             if (userData.username.equals("")) {
-                return 400;
+                return new HttpResponse(400, "{}");
             }
-            user.username = userData.username;
+            sql.append("username = ?");
+            first = false;
+            usernameExist = true;
         }
         if (userData.email != null) {
             if (userData.email.equals("") || !validEmail(userData.email)) {
-                return 400;
+                return new HttpResponse(400, "{}");
             }
-            user.email = userData.email;
+            if (!first) {
+                sql.append(", ");
+            }
+            sql.append("email = ?");
+            first = false;
+            emailExist = true;
         }
         if (userData.password != null) {
             if (userData.password.equals(sha256(""))) {
-                return 400;
+                return new HttpResponse(400, "{}");
             }
-            user.password = userData.password;
+            if (!first) {
+                sql.append(", ");
+            }
+            sql.append("password = ?");
+            first = false;
+            passwordExist = true;
         }
-        return 200;
+        if (!usernameExist && !emailExist && !passwordExist) {
+            return getUser(userData.id); 
+        }
+        sql.append(" WHERE id = ? ");
+        sql.append("RETURNING id, username, email, password ");
+
+        // update user data
+        try (Connection dbConnection = DbUtils.getDBConnection(dbIp, dbPort, dbName, dbPassword);
+            var statement = dbConnection.prepareStatement(sql.toString())) {
+            int i = 1;
+            if (usernameExist) {
+                statement.setString(i, userData.username);
+                i++;
+            }
+            if (emailExist) {
+                statement.setString(i, userData.email);
+                i++;
+            }
+            if (passwordExist) {
+                statement.setString(i, userData.password);
+                i++;
+            }
+            statement.setInt(i, userData.id);
+            try (ResultSet result = statement.executeQuery()) {
+                if (result.next()) {
+                    return new HttpResponse(200, getUserJsonBuilder(result));
+                } else {
+                    return new HttpResponse(500, "{}");
+                }
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+        }        
+        return new HttpResponse(500, "{}");
     }
 
-    private static Integer deleteUser(User userData) {
+    private static HttpResponse deleteUser(User userData) {
         // check if all fields exist
         if (userData.username == null || userData.email == null || userData.password == null) {
-            return 400;
+            return new HttpResponse(400, "{}");
         }
 
-        // check if user exists
-        User user = db.get(userData.id);
-        if (user == null) {
-            return 404;
+        // check user existence
+        if (!checkUserExistence(userData.id)) {
+            return new HttpResponse(404, "{}");
         }
 
         // delete if fields correspond
-        if (userData.username.equals(user.username) && userData.email.equals(user.email) && userData.password.equals(user.password)) {
-            db.remove(userData.id);
-            return 200;
+        String sql = "DELETE FROM users WHERE id = ? AND username = ? AND email = ? AND password = ?";
+        try (Connection dbConnection = DbUtils.getDBConnection(dbIp, dbPort, dbName, dbPassword);
+            var statement = dbConnection.prepareStatement(sql)) {
+            
+            statement.setInt(1, userData.id);
+            statement.setString(2, userData.username);
+            statement.setString(3, userData.email);
+            statement.setString(4, userData.password);
+
+            int deletedRows = statement.executeUpdate();
+
+            if (deletedRows == 1) {
+                return new HttpResponse(200, "{}");
+            }
+
+            return new HttpResponse(401, "{}");
+        } catch (Exception e) {
+            e.printStackTrace();
         }
-        return 401;
+        
+        return new HttpResponse(500, "{}");
     }
 
-    public static String sha256(String password) {
+    private static String sha256(String password) {
         try {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
             byte[] hash = digest.digest(password.getBytes(StandardCharsets.UTF_8));
@@ -326,57 +368,6 @@ public class UserService {
         }
     }
 
-    public static Map<String, String> stringToJSON(String str) {
-        Map<String, String> json = new HashMap<>();
-
-        // check if string is a valid json
-        if (!str.startsWith("{") || !str.endsWith("}")) {
-            return null;
-        } 
-
-        String[] toParse = str.substring(1, str.length() - 1).split(",");
-        for (String i : toParse) {
-            String[] field = i.split(":");
-            if (field.length != 2) {
-                return null;
-            }
-
-            String key = field[0].trim();
-            String value = field[1].trim();
-            if (key.startsWith("\"") && key.endsWith("\"")) {
-                key = key.substring(1, key.length()-1);
-            }
-            if (value.startsWith("\"") && value.endsWith("\"")) {
-                value = value.substring(1, value.length()-1);
-            }
-
-            json.put(key, value);
-        }
-        return json;
-    }
-
-    private static void sendResponse(HttpExchange exchange, String response) throws IOException {
-        exchange.getResponseHeaders().set("Content-Type", "application/json");
-        OutputStream os = exchange.getResponseBody();
-        os.write(response.getBytes(StandardCharsets.UTF_8));
-        os.close();
-    }
-
-    public static int getPort(String service, String configFileName) throws IOException {
-        String config = new String(Files.readAllBytes(Paths.get(configFileName)));
-        int start = config.indexOf(":", config.indexOf("\"port\"", config.indexOf(service))) + 1;
-        int end = config.indexOf(",", start);
-        int port = Integer.parseInt(config.substring(start, end).trim());
-        return port;
-    }
-
-    public static String getIp(String service, String configFileName) throws IOException {
-        String config = new String(Files.readAllBytes(Paths.get(configFileName)));
-        int start = config.indexOf("\"", config.indexOf(":", config.indexOf("\"ip\"", config.indexOf(service)))) + 1;
-        int end = config.indexOf("\"", start);
-        String ip = config.substring(start, end).trim();
-        return ip;
-    }
     private static String userToJson(User user) {
         String json = "{" + "\"id\":" + user.id + "," + 
             "\"username\":" + "\"" + user.username + "\"" + "," +
@@ -386,66 +377,13 @@ public class UserService {
         return json;
     }
 
-    private static void loadUsers(String pathName) throws IOException, FileNotFoundException {
-        File file = new File(pathName);
-        file.createNewFile();
-        
-        // load users
-        Scanner reader = new Scanner(file);
-        while (reader.hasNextLine()) {
-            String userString = reader.nextLine();
-            if (userString.isEmpty()) {
-                continue;
-            }
-            String userData[] = userString.trim().split("\\|");
-            int user_id = Integer.parseInt(userData[0]);
-            User user = new User(user_id, userData[1], userData[2], userData[3]);
-            db.put(user_id, user);
-        }
-        reader.close();
-    }
-
-    private static void storeUsers(String pathName) throws IOException, FileNotFoundException {
-        // store users
-        FileWriter writer = new FileWriter(pathName);
-        for (User user : db.values()) {
-            StringBuilder userData = new StringBuilder();
-            userData.append(user.id);
-            userData.append("|");
-            userData.append(user.username);
-            userData.append("|");
-            userData.append(user.email);
-            userData.append("|");
-            userData.append(user.password);
-            userData.append("\n");
-            writer.write(userData.toString());
-        }
-        writer.close();
-    }
-
-    private static void wipeDB(String pathName) throws IOException {
-        new FileWriter(pathName, false).close();
-    }
-
     private static boolean validEmail(String email) {
         return email.contains("@");
     }
 
-    private static Connection getDBConnection() throws Exception {
-        return DriverManager.getConnection("jdbc:postgresql://" 
-        + dbIp + ":" + dbPort + "/" + dbName, "postgres", dbPassword);
-    }
-
-    private static void sendJsonResponse(HttpExchange exchange, int status, String body) throws IOException{
-        exchange.getResponseHeaders().set("Content-Type", "application/json");
-        exchange.sendResponseHeaders(status, 0);
-        sendResponse(exchange, body);
-        exchange.close();        
-    }
-
     private static void insertUser(User user) {
         String sql = "INSERT INTO users (id, username, email, password) VALUES (?, ?, ?, ?)";
-        try (Connection dbConnection = getDBConnection();
+        try (Connection dbConnection = DbUtils.getDBConnection(dbIp, dbPort, dbName, dbPassword);
             var statement = dbConnection.prepareStatement(sql)) {
             
             statement.setInt(1, user.id);
@@ -457,7 +395,6 @@ public class UserService {
         } catch (Exception e) {
             e.printStackTrace();
         }
-
     }
 }
 
