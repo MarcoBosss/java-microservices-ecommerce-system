@@ -1,40 +1,73 @@
 import com.sun.net.httpserver.HttpServer;
 import com.sun.net.httpserver.HttpHandler;
+import com.google.gson.Gson;
 import com.sun.net.httpserver.HttpExchange;
 
+import java.io.FileReader;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.sql.Connection;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
-import java.sql.ResultSet;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.sql.SQLException;
 import common.HttpResponse;
-import common.ConfigUtils;
 import common.DbUtils;
 import common.HttpUtils;
+import common.JsonUtils;
 
 public class UserService {
+    // service info
+    final static int port = 14001;
+    final static int flushTime = 1;
     static HttpServer server;
-    final static String dbPath = "src/db/user.db";
-    static String dbIp;
-    static int dbPort;
-    static String dbName = "ecommerce";
+    static ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+
+    // database info
+    final static int poolSize = 8;
+    static BlockingQueue<Connection> dbPool = new ArrayBlockingQueue<>(poolSize);
+    static JsonUtils.Service dbService;
+    static String dbName = "userdb";
     static String dbPassword = "password";
 
-    public static void main(String[] args) throws IOException {
-        // loadUsers(dbPath);
-        String configFileName = ConfigUtils.loadConfigFile(args[0]);
-        dbIp = ConfigUtils.getIp("Database", configFileName);
-        dbPort = ConfigUtils.getPort("Database", configFileName);
+    // cache
+    static Map<Integer, User> cache = new ConcurrentHashMap<>();
+    static Map<Integer, User> dirtyUsers = new ConcurrentHashMap<>();
+    static Set<Integer> deletedUsers = ConcurrentHashMap.newKeySet();
 
-        int port = ConfigUtils.getPort("UserService", configFileName);
+    public static void main(String[] args) throws Exception {
+        // database init
+        JsonUtils.Config config = new Gson().fromJson(
+            new FileReader(args[0]), 
+            JsonUtils.Config.class
+        );
+        JsonUtils.ServiceConfig dbConfig = config.UserDatabase;
+        dbService = new JsonUtils.Service("Database", dbConfig.ip, dbConfig.port);
+        initDbPool();
+        
+        // periodic flush thread
+        Runnable task = () -> {
+            try {
+                flushToDB();
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        };
+        scheduler.scheduleAtFixedRate(task, flushTime, flushTime, TimeUnit.SECONDS);
+
+        // service init
         server = HttpServer.create(new InetSocketAddress(port), 0);
-        server.setExecutor(Executors.newFixedThreadPool(512)); // Adjust the pool size as needed
+        server.setExecutor(Executors.newFixedThreadPool(256)); 
         server.createContext("/user", new UserPostHandler());
         server.createContext("/user/", new UserGetHandler());
+        server.createContext("/livecheck", new LiveCheckHandler());
         server.createContext("/shutdown", new ShutdownHandler());
         server.createContext("/wipe", new WipeHandler());
         server.start();
@@ -109,9 +142,27 @@ public class UserService {
                 return;
             }
 
-            // send response json
-            HttpResponse response = getUser(id);
-            HttpUtils.sendJsonResponse(exchange, response.status, response.body);
+            // response
+            User user = cache.get(id);
+            if (user == null) {
+                HttpUtils.sendJsonResponse(exchange, 404, "{}");
+                return;
+            }
+            HttpUtils.sendJsonResponse(exchange, 200, userToJson(user));
+        }
+    }
+
+    static class LiveCheckHandler implements HttpHandler {
+        @Override
+        public void handle(HttpExchange exchange) throws IOException {
+            // non-GET requests
+            if (!"GET".equals(exchange.getRequestMethod())) {
+                HttpUtils.sendJsonResponse(exchange, 404, "{}");
+                return;
+            }
+
+            // live reply
+            HttpUtils.sendJsonResponse(exchange, 200, "{}");
         }
     }
 
@@ -152,67 +203,29 @@ public class UserService {
         } else if ("delete".equals(command)) {
             return deleteUser(userData);
         }
-
-        // service not found
         return new HttpResponse(404, "{}");
     }
 
     private static User jsonToUser(Map<String, String> json) {
-        int id;
         try {
-            id = Integer.parseInt(json.get("id"));
+            int id = Integer.parseInt(json.get("id"));
+            String username = json.get("username");
+            String email = json.get("email");
+            String password = json.get("password");
+            String hash;
+            if (password != null) {
+                hash = sha256(password);
+            } else {
+                hash = null;
+            }
+            return new User(id, username, email, hash);
         } catch (NumberFormatException e) {
             return null;
         }
-    
-        String username = json.get("username");
-        String email = json.get("email");
-        String password = json.get("password");
-        String hash;
-        
-        if (password != null) {
-            hash = sha256(password);
-        } else {
-            hash = null;
-        }
-
-        User user = new User(id, username, email, hash);
-        return user;
     }
-
-    private static HttpResponse getUser(int id) {
-        String sql = "SELECT id, username, email, password FROM users WHERE id = ?";
-        try (Connection dbConnection = DbUtils.getDBConnection(dbIp, dbPort, dbName, dbPassword);
-            var statement = dbConnection.prepareStatement(sql)) {
-            statement.setInt(1, id);
-
-            try (ResultSet result = statement.executeQuery()) {
-                if (result.next()) {
-                    return new HttpResponse(200, getUserJsonBuilder(result));
-                } else {
-                    return new HttpResponse(404, "{}");
-                }
-            }
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
-        return new HttpResponse(500, "{}");
-    }
-
-    private static String getUserJsonBuilder(ResultSet result) throws SQLException{
-        StringBuilder json = new StringBuilder();
-        json.append("{");
-        json.append("\"id\":").append(result.getInt("id")).append(",");
-        json.append("\"username\":\"").append(result.getString("username")).append("\",");
-        json.append("\"email\":\"").append(result.getString("email")).append("\",");
-        json.append("\"password\":\"").append(result.getString("password").toUpperCase()).append("\"");
-        json.append("}");
-        return json.toString();
-    }
-
 
     private static HttpResponse createUser(User userData) {
-        if (checkUserExistence(userData.id)) {
+        if (cache.get(userData.id) != null) {
             return new HttpResponse(409, "{}");
         }
         if (userData.username == null || userData.email == null || userData.password == null) {
@@ -223,100 +236,49 @@ public class UserService {
         }    
         if (!validEmail(userData.email)) {
             return new HttpResponse(400, "{}");
-        }        
-        insertUser(userData);
+        }   
+        deletedUsers.remove(userData.id);
+        cache.put(userData.id, userData);     
+        dirtyUsers.put(userData.id, userData);
         return new HttpResponse(200, userToJson(userData));
     }
 
-    private static boolean checkUserExistence(int id) {
-        String sql = "SELECT 1 FROM users WHERE id = ? LIMIT 1";
-        try (Connection dbConnection = DbUtils.getDBConnection(dbIp, dbPort, dbName, dbPassword);
-            var statement = dbConnection.prepareStatement(sql)) {
-            statement.setInt(1, id);
-
-            try (ResultSet result = statement.executeQuery()) {
-                return result.next();
-            }
-        } catch (Exception e) {
-            e.printStackTrace();
-        }    
-        return false;
+    private static User getUserFromMemory(int id) {
+        User user = dirtyUsers.get(id);
+        if (user == null) {
+            user = cache.get(id);
+        } 
+        return user;    
     }
 
     private static HttpResponse updateUser(User userData) {
-        // check user existence
-        if (!checkUserExistence(userData.id)) {
+        User user = getUserFromMemory(userData.id);
+        // check if user exists
+        if (user == null) {
             return new HttpResponse(404, "{}");
         }
 
-        // build update command 
-        StringBuilder sql = new StringBuilder("UPDATE users SET ");
-        boolean usernameExist=false, emailExist=false, passwordExist=false;
-        boolean first = true;
+        // update userdata
         if (userData.username != null) {
             if (userData.username.equals("")) {
                 return new HttpResponse(400, "{}");
             }
-            sql.append("username = ?");
-            first = false;
-            usernameExist = true;
+            user.username = userData.username;
         }
         if (userData.email != null) {
             if (userData.email.equals("") || !validEmail(userData.email)) {
                 return new HttpResponse(400, "{}");
             }
-            if (!first) {
-                sql.append(", ");
-            }
-            sql.append("email = ?");
-            first = false;
-            emailExist = true;
+            user.email = userData.email;
         }
         if (userData.password != null) {
             if (userData.password.equals(sha256(""))) {
                 return new HttpResponse(400, "{}");
             }
-            if (!first) {
-                sql.append(", ");
-            }
-            sql.append("password = ?");
-            first = false;
-            passwordExist = true;
+            user.password = userData.password;
         }
-        if (!usernameExist && !emailExist && !passwordExist) {
-            return getUser(userData.id); 
-        }
-        sql.append(" WHERE id = ? ");
-        sql.append("RETURNING id, username, email, password ");
-
-        // update user data
-        try (Connection dbConnection = DbUtils.getDBConnection(dbIp, dbPort, dbName, dbPassword);
-            var statement = dbConnection.prepareStatement(sql.toString())) {
-            int i = 1;
-            if (usernameExist) {
-                statement.setString(i, userData.username);
-                i++;
-            }
-            if (emailExist) {
-                statement.setString(i, userData.email);
-                i++;
-            }
-            if (passwordExist) {
-                statement.setString(i, userData.password);
-                i++;
-            }
-            statement.setInt(i, userData.id);
-            try (ResultSet result = statement.executeQuery()) {
-                if (result.next()) {
-                    return new HttpResponse(200, getUserJsonBuilder(result));
-                } else {
-                    return new HttpResponse(500, "{}");
-                }
-            }
-        } catch (Exception e) {
-            e.printStackTrace();
-        }        
-        return new HttpResponse(500, "{}");
+        dirtyUsers.put(userData.id, user);
+        return new HttpResponse(200, userToJson(user));
     }
 
     private static HttpResponse deleteUser(User userData) {
@@ -325,33 +287,20 @@ public class UserService {
             return new HttpResponse(400, "{}");
         }
 
-        // check user existence
-        if (!checkUserExistence(userData.id)) {
+        // check if user exists
+        User user = getUserFromMemory(userData.id);
+        if (user == null) {
             return new HttpResponse(404, "{}");
         }
 
         // delete if fields correspond
-        String sql = "DELETE FROM users WHERE id = ? AND username = ? AND email = ? AND password = ?";
-        try (Connection dbConnection = DbUtils.getDBConnection(dbIp, dbPort, dbName, dbPassword);
-            var statement = dbConnection.prepareStatement(sql)) {
-            
-            statement.setInt(1, userData.id);
-            statement.setString(2, userData.username);
-            statement.setString(3, userData.email);
-            statement.setString(4, userData.password);
-
-            int deletedRows = statement.executeUpdate();
-
-            if (deletedRows == 1) {
-                return new HttpResponse(200, "{}");
-            }
-
-            return new HttpResponse(401, "{}");
-        } catch (Exception e) {
-            e.printStackTrace();
+        if (userData.username.equals(user.username) && userData.email.equals(user.email) && userData.password.equals(user.password)) {
+            cache.remove(userData.id);
+            dirtyUsers.remove(userData.id);
+            deletedUsers.add(userData.id);
+            return new HttpResponse(200, "{}");
         }
-        
-        return new HttpResponse(500, "{}");
+        return new HttpResponse(401, "{}");
     }
 
     private static String sha256(String password) {
@@ -381,20 +330,89 @@ public class UserService {
         return email.contains("@");
     }
 
-    private static void insertUser(User user) {
-        String sql = "INSERT INTO users (id, username, email, password) VALUES (?, ?, ?, ?)";
-        try (Connection dbConnection = DbUtils.getDBConnection(dbIp, dbPort, dbName, dbPassword);
-            var statement = dbConnection.prepareStatement(sql)) {
-            
-            statement.setInt(1, user.id);
-            statement.setString(2, user.username);
-            statement.setString(3, user.email);
-            statement.setString(4, user.password);
+    private static void insertUserToDB(User user) {
+        String sql = """
+            INSERT INTO users (id, username, email, password) 
+            VALUES (?, ?, ?, ?) 
+            ON CONFLICT (id)
+            DO UPDATE SET
+                username = EXCLUDED.username, 
+                email = EXCLUDED.email, 
+                password = EXCLUDED.password
+            """;
+        Connection dbConnection = null;
+        try {
+            dbConnection = dbPool.take();
+            try (var statement = dbConnection.prepareStatement(sql)) {
+                statement.setInt(1, user.id);
+                statement.setString(2, user.username);
+                statement.setString(3, user.email);
+                statement.setString(4, user.password);
 
-            statement.executeUpdate();
+                statement.executeUpdate();
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            e.printStackTrace();
         } catch (Exception e) {
             e.printStackTrace();
+        } finally {
+            if (dbConnection != null) {
+                try {
+                    dbPool.put(dbConnection);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    e.printStackTrace();
+                }
+            }
         }
     }
-}
 
+    private static void deleteUserFromDB(int id) {
+        String sql = "DELETE FROM users WHERE id = ?";
+        Connection dbConnection = null;
+        try {
+            dbConnection = dbPool.take();
+            try (var statement = dbConnection.prepareStatement(sql)) {
+                statement.setInt(1, id);
+                statement.executeUpdate();
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            e.printStackTrace();
+        } catch (Exception e) {
+            e.printStackTrace();
+        } finally {
+            if (dbConnection != null) {
+                try {
+                    dbPool.put(dbConnection);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    e.printStackTrace();
+                }
+            }
+        }
+    }
+
+    private static void flushToDB() {
+        for (Map.Entry<Integer, User> entry : dirtyUsers.entrySet()) {
+            User user = entry.getValue();
+            insertUserToDB(user);
+            dirtyUsers.remove(entry.getKey());
+        }
+
+        for (Integer id : Set.copyOf(deletedUsers)) {
+            deleteUserFromDB(id);
+            deletedUsers.remove(id);
+        }
+    }
+
+    private static void initDbPool() throws SQLException{
+        for (int i=0;i<poolSize;i++) {
+            Connection dbConnection = DbUtils.getDBConnection(
+                dbService.ip, dbService.port, dbName, dbPassword
+            );
+            dbPool.add(dbConnection);
+        }
+    }    
+}

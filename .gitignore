@@ -10,3 +10,6 @@ docs/
 
 # mac files
 .DS_Store
+
+# logs
+logs/

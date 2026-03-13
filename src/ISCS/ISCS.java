@@ -24,9 +24,9 @@ public class ISCS {
 
     public static void main(String[] args) throws IOException {
         configFileName = args[0];
-        int port = getPort("InterServiceCommunication", configFileName);
+        int port = 14000;
         server = HttpServer.create(new InetSocketAddress(port), 0);
-        server.setExecutor(Executors.newFixedThreadPool(512)); // Adjust the pool size as needed
+        server.setExecutor(Executors.newFixedThreadPool(2048)); // Adjust the pool size as needed
         server.createContext("/", new ISCSHandler());
         server.createContext("/shutdown", new ShutdownHandler());
         server.createContext("/wipe", new WipeHandler());

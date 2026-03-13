@@ -99,6 +99,24 @@ public class HttpUtils {
     }
 
     @SuppressWarnings("deprecation")
+    public static void forwardRequestNoResponse(String ip, int port, String requestURI, String requestMethod, String body) throws IOException {
+        // set up connection
+        String urlString = "http://" + ip + ":" + port + requestURI;
+        URL url = new URL(urlString);
+        HttpURLConnection connection = (HttpURLConnection) url.openConnection();
+        connection.setRequestMethod(requestMethod);
+
+        // forward body if POST
+        if ("POST".equals(requestMethod)) {
+            connection.setDoOutput(true);
+            connection.setRequestProperty("Content-Type", "application/json");
+            OutputStream os = connection.getOutputStream();
+            os.write(body.getBytes(StandardCharsets.UTF_8));
+            os.close();
+        }
+    }
+
+    @SuppressWarnings("deprecation")
     public static Integer forwardRequstStatus(String ip, int port, String requestURI, String requestMethod) throws IOException {
         // set up connection
         String urlString = "http://" + ip + ":" + port + requestURI;

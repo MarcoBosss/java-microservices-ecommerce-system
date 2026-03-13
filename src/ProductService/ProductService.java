@@ -1,41 +1,76 @@
 import com.sun.net.httpserver.HttpServer;
 import com.sun.net.httpserver.HttpHandler;
+import com.google.gson.Gson;
 import com.sun.net.httpserver.HttpExchange;
 
+import java.io.FileReader;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.sql.Connection;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import common.HttpResponse;
-import common.ConfigUtils;
 import common.DbUtils;
 import common.HttpUtils;
+import common.JsonUtils;
 
 public class ProductService {
+    // service info
+    final static int port = 14002;
+    final static int flushTime = 1;
     static HttpServer server;
-    final static String dbPath = "src/db/product.db";
-    static String dbIp;
-    static int dbPort;
-    static String dbName = "ecommerce";
+    static ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+
+    // database info
+    final static int poolSize = 8;
+    static BlockingQueue<Connection> dbPool = new ArrayBlockingQueue<>(poolSize); 
+    static JsonUtils.Service dbService;
+    static String dbName = "productdb";
     static String dbPassword = "password";
 
-    public static void main(String[] args) throws IOException {
-        // loadProducts(dbPath);
-        String configFileName = ConfigUtils.loadConfigFile(args[0]);
-        dbIp = ConfigUtils.getIp("Database", configFileName);
-        dbPort = ConfigUtils.getPort("Database", configFileName);
+    // cache
+    static Map<Integer, Product> cache = new ConcurrentHashMap<>();
+    static Map<Integer, Product> dirtyProducts = new ConcurrentHashMap<>();
+    static Set<Integer> deletedProducts = ConcurrentHashMap.newKeySet();
 
-        int port = ConfigUtils.getPort("ProductService", configFileName);
+    public static void main(String[] args) throws Exception {
+        // database init
+        JsonUtils.Config config = new Gson().fromJson(
+            new FileReader(args[0]), 
+            JsonUtils.Config.class
+        );
+        JsonUtils.ServiceConfig dbConfig = config.ProductDatabase;
+        dbService = new JsonUtils.Service("Database", dbConfig.ip, dbConfig.port);
+        initDbPool();
+
+        // periodic flush thread
+        Runnable task = () -> {
+            try {
+                flushToDB();
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        };
+        scheduler.scheduleAtFixedRate(task, flushTime, flushTime, TimeUnit.SECONDS);
+
+        // service init
         server = HttpServer.create(new InetSocketAddress(port), 0);
-        server.setExecutor(Executors.newFixedThreadPool(512)); // Adjust the pool size as needed
+        server.setExecutor(Executors.newFixedThreadPool(256)); 
         server.createContext("/product", new ProductPostHandler());
         server.createContext("/product/", new ProductGetHandler());
+        server.createContext("/livecheck", new LiveCheckHandler());
         server.createContext("/shutdown", new ShutdownHandler());
         server.createContext("/wipe", new WipeHandler());
+        server.createContext("/reserve", new ReservePostHandler());
         server.start();
     }
 
@@ -112,8 +147,24 @@ public class ProductService {
             }
 
             // send response json
-            HttpResponse response = getProduct(id);
-            HttpUtils.sendJsonResponse(exchange, response.status, response.body);
+            Product product = cache.get(id);
+            if (product == null) {
+                HttpUtils.sendJsonResponse(exchange, 404, "{}");
+                return;
+            }
+            HttpUtils.sendJsonResponse(exchange, 200, productToJson(product));            
+        }
+    }
+
+    static class LiveCheckHandler implements HttpHandler {
+        @Override
+        public void handle(HttpExchange exchange) throws IOException {
+            // non-GET requests
+            if (!"GET".equals(exchange.getRequestMethod())) {
+                HttpUtils.sendJsonResponse(exchange, 404, "{}");
+                return;
+            }
+            HttpUtils.sendJsonResponse(exchange, 200, "{}");
         }
     }
 
@@ -150,6 +201,67 @@ public class ProductService {
         
     }
 
+    static class ReservePostHandler implements HttpHandler {
+        @Override
+        public void handle(HttpExchange exchange) throws IOException {
+            // non-POST requests
+            if (!"POST".equals(exchange.getRequestMethod())) {
+                HttpUtils.sendJsonResponse(exchange, 405, "{}");
+                return;
+            }
+
+            // check if content type is json
+            String contentType = exchange.getRequestHeaders().getFirst("Content-Type");
+            if (contentType == null || !contentType.equals("application/json")) {
+                HttpUtils.sendJsonResponse(exchange, 400, "{}");
+                return;
+            }
+
+            // check if body is valid json
+            String body = HttpUtils.getRequestBody(exchange);
+            Map<String, String> json = HttpUtils.stringToJSON(body);
+            if (json == null) {
+                HttpUtils.sendJsonResponse(exchange, 400, "{}");
+                return;                 
+            }
+
+            // parse id and quanitty 
+            Integer id = null;
+            Integer quantity = null;
+            if (json.containsKey("id") && json.containsKey("quantity")) {
+                try {
+                    id = Integer.parseInt(json.get("id"));
+                    quantity = Integer.parseInt(json.get("quantity"));
+                } catch (NumberFormatException e) {
+                    HttpUtils.sendJsonResponse(exchange, 400, "{}");
+                    return;
+                }
+            } 
+            if (id == null || quantity == null || quantity <= 0) {
+                HttpUtils.sendJsonResponse(exchange, 400, "{}");
+                return;
+            }
+
+            // check product existence
+            Product product = getProductFromMemory(id);
+            if (product == null) {
+                HttpUtils.sendJsonResponse(exchange, 404, "{}");
+                return;
+            }
+
+            // update quantity
+            synchronized (product) {
+                if (product.quantity < quantity) {
+                    HttpUtils.sendJsonResponse(exchange, 400, "{\"status\":\"Exceeded quantity limit\"}");
+                    return;
+                }
+                product.quantity -= quantity;
+                dirtyProducts.put(product.id, product);
+                HttpUtils.sendJsonResponse(exchange, 200, "{}");
+            }
+        }
+    }
+
     private static HttpResponse productCommand(String command, Product productData) {
         if ("create".equals(command)) {
             return createProduct(productData);
@@ -158,8 +270,6 @@ public class ProductService {
         } else if ("delete".equals(command)) {
             return deleteProduct(productData);
         }
-
-        // service not found
         return new HttpResponse(404, "{}");
     }
 
@@ -212,39 +322,8 @@ public class ProductService {
         return product;
     }
 
-    private static HttpResponse getProduct(int id) {
-        String sql = "SELECT id, name, description, price, quantity FROM products WHERE id = ?";
-        try (Connection dbConnection = DbUtils.getDBConnection(dbIp, dbPort, dbName, dbPassword);
-            var statement = dbConnection.prepareStatement(sql)) {
-            statement.setInt(1, id);
-
-            try (ResultSet result = statement.executeQuery()) {
-                if (result.next()) {
-                    return new HttpResponse(200, getProductJsonBuilder(result));
-                } else {
-                    return new HttpResponse(404, "{}");
-                }
-            }
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
-        return new HttpResponse(500, "{}");
-    }    
-
-    private static String getProductJsonBuilder(ResultSet result) throws SQLException{
-        StringBuilder json = new StringBuilder();
-        json.append("{");
-        json.append("\"id\":").append(result.getInt("id")).append(",");
-        json.append("\"name\":\"").append(result.getString("name")).append("\",");
-        json.append("\"description\":\"").append(result.getString("description")).append("\",");
-        json.append("\"price\":").append(String.format(Locale.US, "%.2f", result.getDouble("price"))).append(",");
-        json.append("\"quantity\":").append(result.getInt("quantity"));
-        json.append("}");
-        return json.toString();
-    }
-
     private static HttpResponse createProduct(Product productData) {
-        if (checkProductExistence(productData.id)) {
+        if (cache.get(productData.id) != null) {
             return new HttpResponse(409, "{}");
         }
         if (productData.productname == null || productData.price == null || productData.quantity == null || productData.description == null) {
@@ -256,104 +335,60 @@ public class ProductService {
         if (productData.quantity < 0 || productData.price < 0) {
             return new HttpResponse(400, "{}");
         }
-        insertProduct(productData);
+        deletedProducts.remove(productData.id);
+        cache.put(productData.id, productData);
+        dirtyProducts.put(productData.id, productData);
         return new HttpResponse(200, productToJson(productData));
     }
 
+    private static Product getProductFromMemory(int id) {
+        Product product = dirtyProducts.get(id);
+        if (product == null) {
+            product = cache.get(id);
+        } 
+        return product;    
+    }
+
     private static HttpResponse updateProduct(Product productData) {
-        // check product existence
-        if (!checkProductExistence(productData.id)) {
+        Product product = getProductFromMemory(productData.id);
+        // check if product exists
+        if (product == null) {
             return new HttpResponse(404, "{}");
         }
 
-        // build update command 
-        StringBuilder sql = new StringBuilder("UPDATE products SET ");
-        boolean productnameExist=false, descriptionExist=false, priceExist=false, quantityExist=false;
-        boolean first = true;
+        // update product data
         if (productData.productname != null) {
             if (productData.productname.equals("")) {
                 return new HttpResponse(400, "{}");
             }
-            sql.append("name = ?");
-            first = false;
-            productnameExist = true;
+            product.productname = productData.productname;
         }
-        if (productData.description != null) {
+            if (productData.description != null) {
             if (productData.description.equals("")) {
                 return new HttpResponse(400, "{}");
             }
-            if (!first) {
-                sql.append(", ");
-            }
-            sql.append("description = ?");
-            first = false;
-            descriptionExist = true;
-        }
+            product.description = productData.description;
+        }           
         if (productData.price != null) {
             if (productData.price < 0) {
                 return new HttpResponse(400, "{}");
             }
-            if (!first) {
-                sql.append(", ");
-            }
-            sql.append("price = ?");
-            first = false;
-            priceExist = true;
+            product.price = productData.price;
         }
         if (productData.quantity != null) {
             if (productData.quantity < 0) {
                 return new HttpResponse(400, "{}");
             }
-            if (!first) {
-                sql.append(", ");
-            }
-            sql.append("quantity = ?");
-            first = false;
-            quantityExist = true;
+            product.quantity = productData.quantity;
         }
-        if (!productnameExist && !descriptionExist && !priceExist && !quantityExist) {
-            return getProduct(productData.id);
-        }
-        sql.append(" WHERE id = ? ");
-        sql.append("RETURNING id, name, description, price, quantity ");
-
-        // update product data
-        try (Connection dbConnection = DbUtils.getDBConnection(dbIp, dbPort, dbName, dbPassword);
-            var statement = dbConnection.prepareStatement(sql.toString())) {
-            int i = 1;
-            if (productnameExist) {
-                statement.setString(i, productData.productname);
-                i++;
-            }
-            if (descriptionExist) {
-                statement.setString(i, productData.description);
-                i++;
-            }
-            if (priceExist) {
-                statement.setDouble(i, productData.price);
-                i++;
-            }
-            if (quantityExist) {
-                statement.setInt(i, productData.quantity);
-                i++;
-            }
-            statement.setInt(i, productData.id);
-            try (ResultSet result = statement.executeQuery()) {
-                if (result.next()) {
-                    return new HttpResponse(200, getProductJsonBuilder(result));
-                } else {
-                    return new HttpResponse(500, "{}");
-                }
-            }
-        } catch (Exception e) {
-            e.printStackTrace();
-        }        
-        return new HttpResponse(500, "{}");
+        dirtyProducts.put(productData.id, product);
+        return new HttpResponse(200, productToJson(product));
     }
 
     private static HttpResponse deleteProduct(Product productData) {
-        // check product existence
-        if (!checkProductExistence(productData.id)) {
+        // check if product exists
+        Product product = getProductFromMemory(productData.id);
+        if (product == null) {
             return new HttpResponse(404, "{}");
         }
 
@@ -363,59 +398,54 @@ public class ProductService {
         }
 
         // delete if fields correspond
-        String sql = "DELETE FROM products WHERE id = ? AND name = ? AND price = ? AND quantity = ?";
-        try (Connection dbConnection = DbUtils.getDBConnection(dbIp, dbPort, dbName, dbPassword);
-            var statement = dbConnection.prepareStatement(sql)) {
-            
-            statement.setInt(1, productData.id);
-            statement.setString(2, productData.productname);
-            statement.setDouble(3, productData.price);
-            statement.setInt(4, productData.quantity);
-
-            int deletedRows = statement.executeUpdate();
-
-            if (deletedRows == 1) {
-                return new HttpResponse(200, "{}");
-            }
-
-            return new HttpResponse(401, "{}");
-        } catch (Exception e) {
-            e.printStackTrace();
+        if (productData.productname.equals(product.productname) && productData.price.equals(product.price) && productData.quantity.equals(product.quantity)) {
+            cache.remove(productData.id);
+            dirtyProducts.remove(productData.id);
+            deletedProducts.add(productData.id);
+            return new HttpResponse(200, "{}");
         }
-        
-        return new HttpResponse(500, "{}");
+        return new HttpResponse(401, "{}");
     }
 
-    private static void insertProduct(Product product) {
-        String sql = "INSERT INTO products (id, name, description, price, quantity) VALUES (?, ?, ?, ?, ?)";
-        try (Connection dbConnection = DbUtils.getDBConnection(dbIp, dbPort, dbName, dbPassword);
-            var statement = dbConnection.prepareStatement(sql)) {
-            
-            statement.setInt(1, product.id);
-            statement.setString(2, product.productname);
-            statement.setString(3, product.description);
-            statement.setDouble(4, product.price);
-            statement.setInt(5, product.quantity);
+    private static void insertProductToDB(Product product) {
+        String sql = """
+            INSERT INTO products (id, name, description, price, quantity) 
+            VALUES (?, ?, ?, ?, ?) 
+            ON CONFLICT (id)
+            DO UPDATE SET
+                name = EXCLUDED.name, 
+                description = EXCLUDED.description, 
+                price = EXCLUDED.price, 
+                quantity = EXCLUDED.quantity
+            """;
+        Connection dbConnection = null;
+        try {
+            dbConnection = dbPool.take();
+            try(var statement = dbConnection.prepareStatement(sql)) {
+                statement.setInt(1, product.id);
+                statement.setString(2, product.productname);
+                statement.setString(3, product.description);
+                statement.setDouble(4, product.price);
+                statement.setInt(5, product.quantity);
 
-            statement.executeUpdate();
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
-    }
-
-    private static boolean checkProductExistence(int id) {
-        String sql = "SELECT 1 FROM products WHERE id = ? LIMIT 1";
-        try (Connection dbConnection = DbUtils.getDBConnection(dbIp, dbPort, dbName, dbPassword);
-            var statement = dbConnection.prepareStatement(sql)) {
-            statement.setInt(1, id);
-
-            try (ResultSet result = statement.executeQuery()) {
-                return result.next();
+                statement.executeUpdate();
             }
+
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            e.printStackTrace();
         } catch (Exception e) {
             e.printStackTrace();
-        }    
-        return false;
+        } finally {
+            if (dbConnection != null) {
+                try {
+                    dbPool.put(dbConnection);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    e.printStackTrace();
+                }
+            }
+        }
     }
 
     private static String productToJson(Product product) {
@@ -428,5 +458,52 @@ public class ProductService {
         return json;
     }
 
+    private static void deleteProductFromDB(int id) {
+        String sql = "DELETE FROM products WHERE id = ?";
+        Connection dbConnection = null;
+        try {
+            dbConnection = dbPool.take();
+            try (var statement = dbConnection.prepareStatement(sql)) {
+                statement.setInt(1, id);
+                statement.executeUpdate();
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            e.printStackTrace();
+        } catch (Exception e) {
+            e.printStackTrace();
+        } finally {
+            if (dbConnection != null) {
+                try {
+                    dbPool.put(dbConnection);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    e.printStackTrace();
+                }
+            }
+        }
+    }
+
+    private static void flushToDB() {
+        for (Map.Entry<Integer, Product> entry : dirtyProducts.entrySet()) {
+            Product product = entry.getValue();
+            insertProductToDB(product);
+            dirtyProducts.remove(entry.getKey());
+        }
+
+        for (Integer id : Set.copyOf(deletedProducts)) {
+            deleteProductFromDB(id);
+            deletedProducts.remove(id);
+        }
+    }
+
+    private static void initDbPool() throws SQLException{
+        for (int i=0;i<poolSize;i++) {
+            Connection dbConnection = DbUtils.getDBConnection(
+                dbService.ip, dbService.port, dbName, dbPassword
+            );
+            dbPool.add(dbConnection);
+        }
+    }  
 }
 
