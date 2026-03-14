@@ -2,8 +2,6 @@ package common;
 
 import java.util.List;
 
-import common.JsonUtils.ServiceConfig;
-
 public class JsonUtils {
     public static class ServiceConfig {
         public String ip;

@@ -17,7 +17,6 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.sql.Connection;
-import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.List;
 import java.util.ArrayList;
@@ -37,16 +36,14 @@ public class OrderService {
     static ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
 
     // database info
-    final static int poolSize = 8;
+    final static int poolSize = 4;
     static BlockingQueue<Connection> dbPool = new ArrayBlockingQueue<>(poolSize);
     static JsonUtils.Service dbService;
     static String dbName = "orderdb";
     static String dbPassword = "password";
 
     // cache
-    static Map<Integer, Order> cache = new ConcurrentHashMap<>();
     static Map<Integer, Order> dirtyOrders = new ConcurrentHashMap<>();
-    static Set<Integer> deletedOrders = ConcurrentHashMap.newKeySet();
     static Map<Integer, Map<Integer, Integer>> purchases = new ConcurrentHashMap<>();
     static Map<Integer, Object> userLocks = new ConcurrentHashMap<>();
 
@@ -258,7 +255,7 @@ public class OrderService {
                 return new HttpResponse(404, "{\"status\":\"Invalid Request\"}");
             } else if (response.status == 200) {
                 orderData.status = "Success";
-                cache.put(orderData.id, orderData);
+                dirtyOrders.put(orderData.id, orderData);
                 recordPurchase(orderData.user_id, orderData.product_id, orderData.quantity);
                 return new HttpResponse(200, orderToJson(orderData));
             } else if (response.status == 400) {
@@ -317,61 +314,25 @@ public class OrderService {
             "/wipe", "POST", "");
     }
 
-    private static int insertOrderToDB(Order order){
-    String sql = """
-        WITH
-        u AS (
-            SELECT EXISTS (
-                SELECT 1 FROM users WHERE id = ?
-            ) AS user_exists
-        ),
-        p AS (
-            SELECT COALESCE(
-                (SELECT quantity FROM products WHERE id = ?),
-                -1
-            ) AS stock
-        ),
-        upd AS (
-            UPDATE products
-            SET quantity = quantity - ?
-            WHERE id = ?
-            AND EXISTS (SELECT 1 FROM u WHERE user_exists)
-            AND quantity >= ?
-            RETURNING id
-        ),
-        ins AS (
-            INSERT INTO orders (product_id, user_id, quantity)
-            SELECT ?, ?, ?
-            WHERE EXISTS (SELECT 1 FROM upd)
-            RETURNING id
-        )
-        SELECT CASE
-            WHEN EXISTS (SELECT 1 FROM ins) THEN 200
-            WHEN NOT (SELECT user_exists FROM u) THEN 404
-            WHEN (SELECT stock FROM p) = -1 THEN 404
-            WHEN (SELECT stock FROM p) < ? THEN 400
-            ELSE 500
-        END AS status;
-        """;
+    private static void insertOrderToDB(Order order){
+        String sql = """
+            INSERT INTO orders (id, product_id, user_id, quantity) 
+            VALUES (?, ?, ?, ?) 
+            ON CONFLICT (id)
+            DO UPDATE SET
+                product_id = EXCLUDED.product_id, 
+                user_id = EXCLUDED.user_id, 
+                quantity = EXCLUDED.quantity
+            """;
         Connection dbConnection = null;
         try {
             dbConnection = dbPool.take();
             try (var statement = dbConnection.prepareStatement(sql)) {
-                statement.setInt(1, order.user_id);
+                statement.setInt(1, order.id);
                 statement.setInt(2, order.product_id);
-                statement.setInt(3, order.quantity);
-                statement.setInt(4, order.product_id);
-                statement.setInt(5, order.quantity);
-                statement.setInt(6, order.product_id);
-                statement.setInt(7, order.user_id);
-                statement.setInt(8, order.quantity);
-                statement.setInt(9, order.quantity);
-
-                try (ResultSet result = statement.executeQuery()) {
-                    if (result.next()) {
-                        return result.getInt("status");
-                    } 
-                }
+                statement.setInt(3, order.user_id);
+                statement.setInt(4, order.quantity);
+                statement.executeUpdate();
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -388,14 +349,14 @@ public class OrderService {
                 }
             }
         }
-        return 500;
     }
 
     private static void flushToDB() {
-        for (Map.Entry<Integer, Order> entry : dirtyOrders.entrySet()) {
-            Order order = entry.getValue();
-            insertOrderToDB(order);
-            dirtyOrders.remove(entry.getKey());
+        for (Integer id : Set.copyOf(dirtyOrders.keySet())) {
+            Order order = dirtyOrders.remove(id);
+            if (order != null) {
+                insertOrderToDB(order);
+            }
         }
     }
 

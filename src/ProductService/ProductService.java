@@ -16,7 +16,6 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.sql.Connection;
-import java.sql.ResultSet;
 import java.sql.SQLException;
 import common.HttpResponse;
 import common.DbUtils;
@@ -31,7 +30,7 @@ public class ProductService {
     static ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
 
     // database info
-    final static int poolSize = 8;
+    final static int poolSize = 4;
     static BlockingQueue<Connection> dbPool = new ArrayBlockingQueue<>(poolSize); 
     static JsonUtils.Service dbService;
     static String dbName = "productdb";

@@ -15,7 +15,6 @@ import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.util.HashMap;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 
 public class ISCS {
@@ -37,7 +36,6 @@ public class ISCS {
         @SuppressWarnings("deprecation")
         @Override
         public void handle(HttpExchange exchange) throws IOException {
-            String clientAddress = exchange.getRemoteAddress().getAddress().toString();
             String requestMethod = exchange.getRequestMethod();
             String requestURI = exchange.getRequestURI().toString();
             String path = exchange.getRequestURI().getPath();

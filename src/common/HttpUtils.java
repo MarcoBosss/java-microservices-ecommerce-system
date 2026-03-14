@@ -69,6 +69,8 @@ public class HttpUtils {
         String urlString = "http://" + ip + ":" + port + requestURI;
         URL url = new URL(urlString);
         HttpURLConnection connection = (HttpURLConnection) url.openConnection();
+        connection.setConnectTimeout(1000); 
+        connection.setReadTimeout(1000);   
         connection.setRequestMethod(requestMethod);
 
         // forward body if POST
@@ -104,6 +106,8 @@ public class HttpUtils {
         String urlString = "http://" + ip + ":" + port + requestURI;
         URL url = new URL(urlString);
         HttpURLConnection connection = (HttpURLConnection) url.openConnection();
+        connection.setConnectTimeout(1000); 
+        connection.setReadTimeout(1000);   
         connection.setRequestMethod(requestMethod);
 
         // forward body if POST

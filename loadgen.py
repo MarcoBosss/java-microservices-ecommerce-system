@@ -162,7 +162,7 @@ async def do_request(session: aiohttp.ClientSession, method: str, url: str, body
                 text = await resp.text()
                 return HttpResponse(resp.status, text)
     except Exception as e:
-        return HttpResponse(500, str(e))
+        return HttpResponse(599, str(e))
 
 ############################################################
 # FAILURE REPORTING

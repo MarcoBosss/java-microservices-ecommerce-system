@@ -31,7 +31,7 @@ public class UserService {
     static ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
 
     // database info
-    final static int poolSize = 8;
+    final static int poolSize = 4;
     static BlockingQueue<Connection> dbPool = new ArrayBlockingQueue<>(poolSize);
     static JsonUtils.Service dbService;
     static String dbName = "userdb";
