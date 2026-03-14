@@ -16,6 +16,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.sql.Connection;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import common.HttpResponse;
 import common.DbUtils;
@@ -146,7 +147,7 @@ public class ProductService {
             }
 
             // send response json
-            Product product = cache.get(id);
+            Product product = getProduct(id);
             if (product == null) {
                 HttpUtils.sendJsonResponse(exchange, 404, "{}");
                 return;
@@ -242,7 +243,7 @@ public class ProductService {
             }
 
             // check product existence
-            Product product = getProductFromMemory(id);
+            Product product = getProduct(id);
             if (product == null) {
                 HttpUtils.sendJsonResponse(exchange, 404, "{}");
                 return;
@@ -259,6 +260,57 @@ public class ProductService {
                 HttpUtils.sendJsonResponse(exchange, 200, "{}");
             }
         }
+    }
+
+    private static Product getProduct(int id) {
+        // get product from cache
+        Product product = dirtyProducts.get(id);
+        if (product != null) return product;
+        product = cache.get(id);
+        if (product != null) return product;
+
+        // get product from db
+        String sql = "SELECT id, name, description, price, quantity FROM products WHERE id = ?";
+        Connection dbConnection = null;
+        try {
+            dbConnection = dbPool.take();
+            try (var statement = dbConnection.prepareStatement(sql)) {
+                statement.setInt(1, id);
+                try (ResultSet result = statement.executeQuery()) {
+                    if (result.next()) {
+                        product = buildProduct(result);
+                        cache.put(id, product);
+                        return product;
+                    } else {
+                        return null;
+                    }
+                }
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            e.printStackTrace();
+        } catch (Exception e) {
+            e.printStackTrace();
+        } finally {
+            if (dbConnection != null) {
+                try {
+                    dbPool.put(dbConnection);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    e.printStackTrace();
+                }
+            }
+        }  
+        return null;     
+    }
+
+    private static Product buildProduct(ResultSet result) throws SQLException {
+        return new Product(
+            result.getInt("id"), 
+            result.getString("name"), 
+            result.getString("description"), 
+            result.getFloat("price"), 
+            result.getInt("quantity"));
     }
 
     private static HttpResponse productCommand(String command, Product productData) {
@@ -322,7 +374,7 @@ public class ProductService {
     }
 
     private static HttpResponse createProduct(Product productData) {
-        if (cache.get(productData.id) != null) {
+        if (getProduct(productData.id) != null) {
             return new HttpResponse(409, "{}");
         }
         if (productData.productname == null || productData.price == null || productData.quantity == null || productData.description == null) {
@@ -340,16 +392,8 @@ public class ProductService {
         return new HttpResponse(200, productToJson(productData));
     }
 
-    private static Product getProductFromMemory(int id) {
-        Product product = dirtyProducts.get(id);
-        if (product == null) {
-            product = cache.get(id);
-        } 
-        return product;    
-    }
-
     private static HttpResponse updateProduct(Product productData) {
-        Product product = getProductFromMemory(productData.id);
+        Product product = getProduct(productData.id);
         // check if product exists
         if (product == null) {
             return new HttpResponse(404, "{}");
@@ -386,7 +430,7 @@ public class ProductService {
 
     private static HttpResponse deleteProduct(Product productData) {
         // check if product exists
-        Product product = getProductFromMemory(productData.id);
+        Product product = getProduct(productData.id);
         if (product == null) {
             return new HttpResponse(404, "{}");
         }

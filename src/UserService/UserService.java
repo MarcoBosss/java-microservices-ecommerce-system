@@ -9,6 +9,7 @@ import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.sql.Connection;
+import java.sql.ResultSet;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
@@ -143,7 +144,7 @@ public class UserService {
             }
 
             // response
-            User user = cache.get(id);
+            User user = getUser(id);
             if (user == null) {
                 HttpUtils.sendJsonResponse(exchange, 404, "{}");
                 return;
@@ -195,6 +196,56 @@ public class UserService {
         }
     }
 
+    private static User getUser(int id) {
+        // get user from cache
+        User user = dirtyUsers.get(id);
+        if (user != null) return user;
+        user = cache.get(id);
+        if (user != null) return user;
+
+        // get user from db
+        String sql = "SELECT id, username, email, password FROM users WHERE id = ?";
+        Connection dbConnection = null;
+        try {
+            dbConnection = dbPool.take();
+            try (var statement = dbConnection.prepareStatement(sql)) {
+                statement.setInt(1, id);
+                try (ResultSet result = statement.executeQuery()) {
+                    if (result.next()) {
+                        user = buildUser(result);
+                        cache.put(id, user);
+                        return user;
+                    } else {
+                        return null;
+                    }
+                }
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            e.printStackTrace();
+        } catch (Exception e) {
+            e.printStackTrace();
+        } finally {
+            if (dbConnection != null) {
+                try {
+                    dbPool.put(dbConnection);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    e.printStackTrace();
+                }
+            }
+        }  
+        return null;     
+    }
+
+    private static User buildUser(ResultSet result) throws SQLException {
+        return new User(
+            result.getInt("id"), 
+            result.getString("username"), 
+            result.getString("email"), 
+            result.getString("password"));
+    }
+
     private static HttpResponse userCommand(String command, User userData) {
         if ("create".equals(command)) {
             return createUser(userData);
@@ -225,7 +276,7 @@ public class UserService {
     }
 
     private static HttpResponse createUser(User userData) {
-        if (cache.get(userData.id) != null) {
+        if (getUser(userData.id) != null) {
             return new HttpResponse(409, "{}");
         }
         if (userData.username == null || userData.email == null || userData.password == null) {
@@ -243,16 +294,8 @@ public class UserService {
         return new HttpResponse(200, userToJson(userData));
     }
 
-    private static User getUserFromMemory(int id) {
-        User user = dirtyUsers.get(id);
-        if (user == null) {
-            user = cache.get(id);
-        } 
-        return user;    
-    }
-
     private static HttpResponse updateUser(User userData) {
-        User user = getUserFromMemory(userData.id);
+        User user = getUser(userData.id);
         // check if user exists
         if (user == null) {
             return new HttpResponse(404, "{}");
@@ -288,7 +331,7 @@ public class UserService {
         }
 
         // check if user exists
-        User user = getUserFromMemory(userData.id);
+        User user = getUser(userData.id);
         if (user == null) {
             return new HttpResponse(404, "{}");
         }

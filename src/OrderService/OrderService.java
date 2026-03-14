@@ -17,6 +17,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.sql.Connection;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.List;
 import java.util.ArrayList;
@@ -256,7 +257,6 @@ public class OrderService {
             } else if (response.status == 200) {
                 orderData.status = "Success";
                 dirtyOrders.put(orderData.id, orderData);
-                recordPurchase(orderData.user_id, orderData.product_id, orderData.quantity);
                 return new HttpResponse(200, orderToJson(orderData));
             } else if (response.status == 400) {
                 return new HttpResponse(400, response.body); 
@@ -276,28 +276,86 @@ public class OrderService {
         return json;
     }
 
+    private static String purchaseHistoryToString(Map<Integer, Integer> purchaseHistory) {
+        StringBuilder response = new StringBuilder();
+        response.append("{");
+        
+        boolean first = true;
+        for (int product_id : purchaseHistory.keySet()) {
+            if (!first) {
+                response.append(", ");
+            }
+            first = false;
+            response.append("\"");
+            response.append(product_id);
+            response.append("\":");
+            response.append(purchaseHistory.get(product_id));
+        }
+
+        response.append("}");
+        return response.toString();
+    }
+
+    private static Map<Integer, Integer> resultToPurchaseHistory(ResultSet result) throws SQLException {
+        Map<Integer, Integer> purchaseHistory = new HashMap<>();
+        while (result.next()) {
+            purchaseHistory.put(result.getInt("product_id"), result.getInt("total"));
+        }
+        return purchaseHistory;
+    }
+
+    private static Map<Integer, Integer> recordRecentPurchase(int user_id, Map<Integer, Integer> purchaseHistory) {
+        Map<Integer, Integer> copy = new HashMap<>(purchaseHistory);
+        for (Order order : dirtyOrders.values()) {
+            if (order.user_id == user_id) {
+                copy.merge(order.product_id, order.quantity, Integer::sum);
+            }
+        }
+        return copy;
+    }
+
     private static String getPurchaseHistory(int user_id) {
         synchronized (getLock(user_id)) {
-            // user id did not purchase anything
+            // get puchase history from cache
             Map<Integer, Integer> purchaseHistory = purchases.get(user_id);
-            if (purchaseHistory == null) return "{}";
-            StringBuilder response = new StringBuilder();
-            response.append("{");
-            
-            boolean first = true;
-            for (int product_id : purchaseHistory.keySet()) {
-                if (!first) {
-                    response.append(", ");
-                }
-                first = false;
-                response.append("\"");
-                response.append(product_id);
-                response.append("\":");
-                response.append(purchaseHistory.get(product_id));
-            }
+            if (purchaseHistory != null) {
+                return purchaseHistoryToString(recordRecentPurchase(user_id, purchaseHistory));
+            } 
 
-            response.append("}");
-            return response.toString();
+            // get purchase history from memory
+            String sql = """
+                SELECT product_id, SUM(quantity) AS total
+                FROM orders
+                WHERE user_id = ?
+                GROUP BY product_id
+                """;
+            Connection dbConnection = null;
+            try {
+                dbConnection = dbPool.take();
+                try (var statement = dbConnection.prepareStatement(sql)) {
+                    statement.setInt(1, user_id);
+                    try (ResultSet result = statement.executeQuery()) {
+                        purchaseHistory = resultToPurchaseHistory(result);
+                        purchases.put(user_id, purchaseHistory);
+                        return purchaseHistoryToString(recordRecentPurchase(user_id, purchaseHistory));
+                    }
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                e.printStackTrace();
+            } catch (Exception e) {
+                e.printStackTrace();
+            } finally {
+                if (dbConnection != null) {
+                    try {
+                        dbPool.put(dbConnection);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        e.printStackTrace();
+                    }
+                }
+            }  
+            return "{}";  
         }
     }
 
@@ -353,9 +411,14 @@ public class OrderService {
 
     private static void flushToDB() {
         for (Integer id : Set.copyOf(dirtyOrders.keySet())) {
-            Order order = dirtyOrders.remove(id);
-            if (order != null) {
-                insertOrderToDB(order);
+            Order order = dirtyOrders.get(id);
+            if (order == null) continue;
+            synchronized(getLock(order.user_id)) {
+                order = dirtyOrders.remove(id);
+                if (order != null) {
+                    recordPurchase(order.user_id, order.product_id, order.quantity);
+                    insertOrderToDB(order);
+                }
             }
         }
     }
