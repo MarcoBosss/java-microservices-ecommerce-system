@@ -20,7 +20,7 @@ RUN_CORRECTNESS_SUITE = True
 RUN_LOAD_PHASE = True
 AUTO_TEST_TPS = True
 
-DURATION_SECONDS = 600
+DURATION_SECONDS = 20
 TARGET_TPS = 100
 WORKERS = 512
 
@@ -33,18 +33,19 @@ WAIT_AFTER_SEED_SECONDS = 2
 VERIFY_SEED_SAMPLE = True
 
 # workload mix must sum to 100
-MIX_USER_GET = 15
-MIX_PRODUCT_GET = 15
-MIX_ORDER_POST = 15
+MIX_USER_GET = 14
+MIX_PRODUCT_GET = 14
+MIX_ORDER_POST = 14
 MIX_USER_PURCHASED = 10
 MIX_USER_UPDATE = 10
 MIX_PRODUCT_UPDATE = 10
 MIX_USER_CREATE = 5
 MIX_USER_DELETE = 5
 MIX_PRODUCT_CREATE = 5
-MIX_PRODUCT_DELETE = 10
+MIX_PRODUCT_DELETE = 8
+MIX_BAD_API = 5
 
-TPS_LEVELS = [4000]
+TPS_LEVELS = [4000, 5000, 5500, 6000, 6500, 7000]
 # TPS_LEVELS = [2, 10, 25, 50, 100, 175, 250, 500, 750, 1000, 2500, 4000, 8000, 10000, 20000]
 
 GRADE_THRESHOLDS = {
@@ -214,6 +215,17 @@ class FailureReporter:
 ############################################################
 # PURCHASE TRACKER
 ############################################################
+
+class UserOpCoordinator:
+    def __init__(self):
+        self._locks: Dict[int, asyncio.Lock] = {}
+        self._guard = asyncio.Lock()
+
+    async def get_lock(self, user_id: int) -> asyncio.Lock:
+        async with self._guard:
+            if user_id not in self._locks:
+                self._locks[user_id] = asyncio.Lock()
+            return self._locks[user_id]
 
 class PurchaseTracker:
     def __init__(self):
@@ -581,10 +593,134 @@ async def fail_and_report(
     )
     return False
 
+async def perform_bad_api(
+    session: aiohttp.ClientSession,
+    rng: random.Random,
+    reporter: FailureReporter,
+) -> bool:
+    bad_case = rng.randint(0, 5)
+
+    if bad_case == 0:
+        path = "/user"
+        payload = {
+            "command": "placeeee oooorder",
+            "id": 123,
+            "username": "x",
+            "email": "x@test.com",
+            "password": "pw",
+        }
+        resp = await do_request(session, "POST", base_url(path), payload)
+        if resp.status != 404:
+            return await fail_and_report(
+                reporter,
+                reason="bad_api_invalid_command",
+                method="POST",
+                path=path,
+                payload=payload,
+                expected="status=404 for invalid command",
+                resp=resp,
+            )
+        return True
+
+    if bad_case == 1:
+        path = "/product"
+        payload = {
+            "command": "create",
+            "id": 999100 + rng.randint(0, 100000),
+            "name": "bad-product",
+            "price": 10.00,
+            "quantity": 1,
+        }
+        resp = await do_request(session, "POST", base_url(path), payload)
+        if resp.status != 400:
+            return await fail_and_report(
+                reporter,
+                reason="bad_api_missing_product_field",
+                method="POST",
+                path=path,
+                payload=payload,
+                expected="status=400 for missing product field",
+                resp=resp,
+            )
+        return True
+
+    if bad_case == 2:
+        path = "/user/not-an-int"
+        resp = await do_request(session, "GET", base_url(path))
+        if resp.status != 400:
+            return await fail_and_report(
+                reporter,
+                reason="bad_api_malformed_user_get",
+                method="GET",
+                path=path,
+                payload=None,
+                expected="status=400 for malformed user id",
+                resp=resp,
+            )
+        return True
+
+    if bad_case == 3:
+        path = "/does-not-exist"
+        resp = await do_request(session, "GET", base_url(path))
+        if resp.status != 404:
+            return await fail_and_report(
+                reporter,
+                reason="bad_api_bad_route",
+                method="GET",
+                path=path,
+                payload=None,
+                expected="status=404 for bad route",
+                resp=resp,
+            )
+        return True
+
+    if bad_case == 4:
+        path = "/order"
+        payload = {
+            "command": "place order",
+            "user_id": 100001 + rng.randint(0, SEED_USERS - 1),
+            "product_id": 200001 + rng.randint(0, SEED_PRODUCTS - 1),
+            "quantity": -1,
+        }
+        resp = await do_request(session, "POST", base_url(path), payload)
+        if resp.status != 400:
+            return await fail_and_report(
+                reporter,
+                reason="bad_api_negative_order_quantity",
+                method="POST",
+                path=path,
+                payload=payload,
+                expected="status=400 for negative quantity",
+                resp=resp,
+            )
+        return True
+
+    path = "/user"
+    payload = {
+        "command": "create",
+        "id": 888000 + rng.randint(0, 100000),
+        "username": "baduser",
+        "email": "not-an-email",
+        "password": "pw",
+    }
+    resp = await do_request(session, "POST", base_url(path), payload)
+    if resp.status != 400:
+        return await fail_and_report(
+            reporter,
+            reason="bad_api_invalid_email",
+            method="POST",
+            path=path,
+            payload=payload,
+            expected="status=400 for invalid email",
+            resp=resp,
+        )
+    return True
+
 async def perform_one(
     session: aiohttp.ClientSession,
     rng: random.Random,
     tracker: PurchaseTracker,
+    user_ops: UserOpCoordinator,
     dyn: DynamicStore,
     reporter: FailureReporter,
 ) -> bool:
@@ -602,6 +738,7 @@ async def perform_one(
     t8 = t7 + MIX_USER_DELETE
     t9 = t8 + MIX_PRODUCT_CREATE
     t10 = t9 + MIX_PRODUCT_DELETE
+    t11 = t10 + MIX_BAD_API
 
     if x < t1:
         path = f"/user/{user_id}"
@@ -664,68 +801,80 @@ async def perform_one(
             "product_id": product_id,
             "quantity": qty,
         }
-        resp = await do_request(session, "POST", base_url(path), payload)
-        if resp.status != 200:
-            return await fail_and_report(
-                reporter,
-                reason="order_post_status",
-                method="POST",
-                path=path,
-                payload=payload,
-                expected=f"status=200 and order status=Success for user_id={user_id}, product_id={product_id}, quantity={qty}",
-                resp=resp,
-            )
-        o, ok = parse_order(resp.body)
-        if not (ok and o.get("status") == "Success" and o.get("user_id") == user_id and o.get("product_id") == product_id and o.get("quantity") == qty):
-            return await fail_and_report(
-                reporter,
-                reason="order_post_body",
-                method="POST",
-                path=path,
-                payload=payload,
-                expected=f"JSON order with status=Success, user_id={user_id}, product_id={product_id}, quantity={qty}",
-                resp=resp,
-            )
-        await tracker.add(user_id, product_id, qty)
-        return True
+
+        user_lock = await user_ops.get_lock(user_id)
+        async with user_lock:
+            resp = await do_request(session, "POST", base_url(path), payload)
+            if resp.status != 200:
+                return await fail_and_report(
+                    reporter,
+                    reason="order_post_status",
+                    method="POST",
+                    path=path,
+                    payload=payload,
+                    expected=f"status=200 and order status=Success for user_id={user_id}, product_id={product_id}, quantity={qty}",
+                    resp=resp,
+                )
+            o, ok = parse_order(resp.body)
+            if not (
+                ok
+                and o.get("status") == "Success"
+                and o.get("user_id") == user_id
+                and o.get("product_id") == product_id
+                and o.get("quantity") == qty
+            ):
+                return await fail_and_report(
+                    reporter,
+                    reason="order_post_body",
+                    method="POST",
+                    path=path,
+                    payload=payload,
+                    expected=f"JSON order with status=Success, user_id={user_id}, product_id={product_id}, quantity={qty}",
+                    resp=resp,
+                )
+            await tracker.add(user_id, product_id, qty)
+            return True
 
     if x < t4:
         path = f"/user/purchased/{user_id}"
-        resp = await do_request(session, "GET", base_url(path))
-        if resp.status != 200:
-            return await fail_and_report(
-                reporter,
-                reason="user_purchased_status",
-                method="GET",
-                path=path,
-                payload=None,
-                expected="status=200 and correct purchased aggregate map",
-                resp=resp,
-            )
-        got, ok = parse_purchased(resp.body)
-        if not ok:
-            return await fail_and_report(
-                reporter,
-                reason="user_purchased_parse",
-                method="GET",
-                path=path,
-                payload=None,
-                expected="valid JSON object mapping product_id -> quantity",
-                resp=resp,
-            )
-        expect = await tracker.snapshot(user_id)
-        for pid, qty in expect.items():
-            if got.get(str(pid)) != qty:
+
+        user_lock = await user_ops.get_lock(user_id)
+        async with user_lock:
+            expect = await tracker.snapshot(user_id)
+            resp = await do_request(session, "GET", base_url(path))
+            if resp.status != 200:
                 return await fail_and_report(
                     reporter,
-                    reason="user_purchased_mismatch",
+                    reason="user_purchased_status",
                     method="GET",
                     path=path,
                     payload=None,
-                    expected=f"product {pid} should have quantity {qty}",
+                    expected="status=200 and correct purchased aggregate map",
                     resp=resp,
                 )
-        return True
+            got, ok = parse_purchased(resp.body)
+            if not ok:
+                return await fail_and_report(
+                    reporter,
+                    reason="user_purchased_parse",
+                    method="GET",
+                    path=path,
+                    payload=None,
+                    expected="valid JSON object mapping product_id -> quantity",
+                    resp=resp,
+                )
+            for pid, qty in expect.items():
+                if got.get(str(pid)) != qty:
+                    return await fail_and_report(
+                        reporter,
+                        reason="user_purchased_mismatch",
+                        method="GET",
+                        path=path,
+                        payload=None,
+                        expected=f"product {pid} should have quantity {qty}",
+                        resp=resp,
+                    )
+            return True
 
     if x < t5:
         path = "/user"
@@ -881,6 +1030,9 @@ async def perform_one(
             )
         return True
 
+    if x < t11:
+        return await perform_bad_api(session, rng, reporter)
+
     return False
 
 def grade_for_ok_tps(ok_tps: float):
@@ -921,18 +1073,13 @@ async def live_tps_monitor(stats: Stats, duration_seconds: int):
         prev_ok = ok
         prev_fail = fail
 
-class PerSecondStats:
-    def __init__(self):
-        self.ok_per_second = []
-        self.fail_per_second = []
-        self.sent_per_second = []
-
 async def worker(
     session: aiohttp.ClientSession,
     wid: int,
     queue: asyncio.Queue,
     stats: Stats,
     tracker: PurchaseTracker,
+    user_ops: UserOpCoordinator,
     dyn: DynamicStore,
     reporter: FailureReporter,
 ):
@@ -942,7 +1089,7 @@ async def worker(
         if item is None:
             queue.task_done()
             return
-        ok = await perform_one(session, rng, tracker, dyn, reporter)
+        ok = await perform_one(session, rng, tracker, user_ops, dyn, reporter)
         if ok:
             await stats.add_ok()
         else:
@@ -952,6 +1099,7 @@ async def worker(
 async def run_load(
     session: aiohttp.ClientSession,
     tracker: PurchaseTracker,
+    user_ops: UserOpCoordinator,
     dyn: DynamicStore,
     reporter: FailureReporter,
     target_tps: int
@@ -962,7 +1110,7 @@ async def run_load(
     queue = asyncio.Queue(maxsize=max(target_tps * 2, 1000))
 
     worker_tasks = [
-        asyncio.create_task(worker(session, i, queue, stats, tracker, dyn, reporter))
+        asyncio.create_task(worker(session, i, queue, stats, tracker, user_ops, dyn, reporter))
         for i in range(WORKERS)
     ]
 
@@ -1026,12 +1174,13 @@ async def auto_test_tps(session: aiohttp.ClientSession):
     reporter = FailureReporter()
 
     tracker = PurchaseTracker()
+    user_ops = UserOpCoordinator()
 
     for tps in TPS_LEVELS:
         print(f"\n--- Testing target TPS = {tps} ---")
 
         dyn = DynamicStore()
-        result = await run_load(session, tracker, dyn, reporter, tps)
+        result = await run_load(session, tracker, user_ops, dyn, reporter, tps)
         results.append(result)
 
         if result["ok_tps"] > best_ok_tps:
@@ -1095,9 +1244,10 @@ async def main():
             await auto_test_tps(session)
         elif RUN_LOAD_PHASE:
             tracker = PurchaseTracker()
+            user_ops = UserOpCoordinator()
             dyn = DynamicStore()
             reporter = FailureReporter()
-            await run_load(session, tracker, dyn, reporter, TARGET_TPS)
+            await run_load(session, tracker, user_ops, dyn, reporter, TARGET_TPS)
 
 if __name__ == "__main__":
     asyncio.run(main())
