@@ -10,6 +10,8 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.sql.Connection;
 import java.sql.ResultSet;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
@@ -27,7 +29,7 @@ import common.JsonUtils;
 public class UserService {
     // service info
     final static int port = 14001;
-    final static int flushTime = 1;
+    final static int flushTime = 2;
     static HttpServer server;
     static ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
 
@@ -71,6 +73,7 @@ public class UserService {
         server.createContext("/livecheck", new LiveCheckHandler());
         server.createContext("/shutdown", new ShutdownHandler());
         server.createContext("/wipe", new WipeHandler());
+        server.createContext("/standby", new StandbyHandler());
         server.start();
     }
 
@@ -192,6 +195,29 @@ public class UserService {
             }
             // wipeDB(dbPath);
             // db.clear();
+            HttpUtils.sendJsonResponse(exchange, 200, "{}");
+        }
+    }
+
+    static class StandbyHandler implements HttpHandler {
+        @Override
+        public void handle(HttpExchange exchange) throws IOException {
+            // non-POST requests
+            if (!"POST".equals(exchange.getRequestMethod())) {
+                HttpUtils.sendJsonResponse(exchange, 404, "{}");
+                return;
+            }
+            // flush to db 
+            try {
+                flushToDB();
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+
+            // clear cache
+            cache.clear();
+            dirtyUsers.clear();
+            deletedUsers.clear();
             HttpUtils.sendJsonResponse(exchange, 200, "{}");
         }
     }
@@ -373,7 +399,8 @@ public class UserService {
         return email.contains("@");
     }
 
-    private static void insertUserToDB(User user) {
+    private static void insertUsersToDB(List<User> users) {
+        if (users.isEmpty()) return;
         String sql = """
             INSERT INTO users (id, username, email, password) 
             VALUES (?, ?, ?, ?) 
@@ -386,14 +413,23 @@ public class UserService {
         Connection dbConnection = null;
         try {
             dbConnection = dbPool.take();
+            dbConnection.setAutoCommit(false);
             try (var statement = dbConnection.prepareStatement(sql)) {
-                statement.setInt(1, user.id);
-                statement.setString(2, user.username);
-                statement.setString(3, user.email);
-                statement.setString(4, user.password);
-
-                statement.executeUpdate();
-            }
+                for (User user:users) {
+                    statement.setInt(1, user.id);
+                    statement.setString(2, user.username);
+                    statement.setString(3, user.email);
+                    statement.setString(4, user.password);
+                    statement.addBatch();
+                }
+                statement.executeBatch();
+                dbConnection.commit();
+        } catch (Exception e) {
+            dbConnection.rollback();
+            throw e;
+        } finally {
+            dbConnection.setAutoCommit(true);
+        }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             e.printStackTrace();
@@ -411,15 +447,26 @@ public class UserService {
         }
     }
 
-    private static void deleteUserFromDB(int id) {
+    private static void deleteUsersFromDB(List<Integer> ids) {
+        if (ids.isEmpty()) return;
         String sql = "DELETE FROM users WHERE id = ?";
         Connection dbConnection = null;
         try {
             dbConnection = dbPool.take();
+            dbConnection.setAutoCommit(false);
             try (var statement = dbConnection.prepareStatement(sql)) {
-                statement.setInt(1, id);
-                statement.executeUpdate();
-            }
+                for (Integer id:ids) {
+                    statement.setInt(1, id);
+                    statement.addBatch();
+                }
+                statement.executeBatch();
+                dbConnection.commit();
+        } catch (Exception e) {
+            dbConnection.rollback();
+            throw e;
+        } finally {
+            dbConnection.setAutoCommit(true);
+        }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             e.printStackTrace();
@@ -438,16 +485,21 @@ public class UserService {
     }
 
     private static void flushToDB() {
+        List<User> usersToInsert = new ArrayList<>();
+        List<Integer> usersToDelete = new ArrayList<>();
+
         for (Map.Entry<Integer, User> entry : dirtyUsers.entrySet()) {
             User user = entry.getValue();
-            insertUserToDB(user);
             dirtyUsers.remove(entry.getKey());
+            usersToInsert.add(user);
         }
 
         for (Integer id : Set.copyOf(deletedUsers)) {
-            deleteUserFromDB(id);
             deletedUsers.remove(id);
+            usersToDelete.add(id);
         }
+        insertUsersToDB(usersToInsert);
+        deleteUsersFromDB(usersToDelete);
     }
 
     private static void initDbPool() throws SQLException{

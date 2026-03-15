@@ -27,9 +27,6 @@ public class LoadBalancer {
 
     // other serivices info
     static AtomicInteger orderId = new AtomicInteger(0);
-    static AtomicInteger userServiceIndex = new AtomicInteger(0);
-    static AtomicInteger productServiceIndex = new AtomicInteger(0);
-    static AtomicInteger orderServiceIndex = new AtomicInteger(0);
     static List<JsonUtils.Service> userServices = new ArrayList<>();
     static List<JsonUtils.Service> productServices = new ArrayList<>();
     static List<JsonUtils.Service> orderServices = new ArrayList<>();
@@ -63,21 +60,21 @@ public class LoadBalancer {
     static class UserPurchasedHandler implements HttpHandler {
         @Override
         public void handle(HttpExchange exchange) throws IOException {
-            handleHelper(exchange, orderServices, orderServiceIndex);  
+            handleHelper(exchange, orderServices);  
         }
     }
 
     static class UserHandler implements HttpHandler {
         @Override
         public void handle(HttpExchange exchange) throws IOException {
-            handleHelper(exchange, userServices, userServiceIndex); 
+            handleHelper(exchange, userServices); 
         }
     }
 
     static class ProductHandler implements HttpHandler {
         @Override
         public void handle(HttpExchange exchange) throws IOException {
-            handleHelper(exchange, productServices, productServiceIndex);
+            handleHelper(exchange, productServices);
         }
     }
 
@@ -99,19 +96,27 @@ public class LoadBalancer {
                 HttpUtils.sendJsonResponse(exchange, 503, ""); 
                 return;
             }
-            HttpResponse response = HttpUtils.forwardRequest(
-                service.ip, 
-                service.port, 
-                requestURI, 
-                requestMethod, 
-                body
-            );
-            HttpUtils.sendJsonResponse(exchange, response.status, response.body);  
+            try {
+                HttpResponse response = HttpUtils.forwardRequest(
+                    service.ip, 
+                    service.port, 
+                    requestURI, 
+                    requestMethod, 
+                    body
+                );
+                HttpUtils.sendJsonResponse(exchange, response.status, response.body);   
+            } catch (Exception e) {
+                System.out.println(service.type + " request failed: " + service.ip + ":" + service.port);
+                HttpUtils.sendJsonResponse(exchange, 503, "{}");
+            }
         }
     }
 
-    private static void healthCheck(List<JsonUtils.Service> services) {
-        for (JsonUtils.Service service : services) {
+    private static void healthCheck(List<JsonUtils.Service> services) throws IOException {
+        // heath check for main services
+        JsonUtils.Service service;
+        for (int i=0;i<services.size()-1;i++) {
+            service = services.get(i);
             try {
                 HttpResponse response = HttpUtils.forwardRequest(
                     service.ip, 
@@ -121,15 +126,36 @@ public class LoadBalancer {
                     ""
                 );
                 service.isAlive = (response.status == 200);
+                if (!service.isAlive)  {
+                    replaceService(i, services);
+                }
             } catch (Exception e) {
                 service.isAlive = false;
+                replaceService(i, services);
                 System.out.println(
-                    service.type + " Unavailable: " + service.ip);
+                    service.type + " unavailable: " + service.ip);
             }
+        }
+
+        // health check for backup service
+        service = services.get(services.size()-1);
+        try {
+            HttpResponse response = HttpUtils.forwardRequest(
+                service.ip, 
+                service.port, 
+                "/livecheck", 
+                "GET", 
+                ""
+            );
+            service.isAlive = (response.status == 200);
+        } catch (Exception e) {
+            service.isAlive = false;
+            System.out.println(
+                service.type + " backup unavailable: " + service.ip);
         }
     }
 
-    private static void handleHelper(HttpExchange exchange, List<JsonUtils.Service> services, AtomicInteger index) throws IOException {
+    private static void handleHelper(HttpExchange exchange, List<JsonUtils.Service> services) throws IOException {
         String body = HttpUtils.getRequestBody(exchange);
         String requestURI = exchange.getRequestURI().toString();
         String requestMethod = exchange.getRequestMethod();
@@ -140,14 +166,20 @@ public class LoadBalancer {
             HttpUtils.sendJsonResponse(exchange, 503, ""); 
             return;
         }
-        HttpResponse response = HttpUtils.forwardRequest(
-            service.ip, 
-            service.port, 
-            requestURI, 
-            requestMethod, 
-            body
-        );
-        HttpUtils.sendJsonResponse(exchange, response.status, response.body);   
+        try {
+            HttpResponse response = HttpUtils.forwardRequest(
+                service.ip, 
+                service.port, 
+                requestURI, 
+                requestMethod, 
+                body
+            );
+            HttpUtils.sendJsonResponse(exchange, response.status, response.body);   
+        } catch (Exception e) {
+            System.out.println(service.type + " request failed: " + service.ip + ":" + service.port);
+            HttpUtils.sendJsonResponse(exchange, 503, "{}");
+        }
+
     }
 
     private static int extractId(String method, String URI, Map<String, String> json) {
@@ -185,9 +217,45 @@ public class LoadBalancer {
     }
 
     private static JsonUtils.Service selectService(int id, List<JsonUtils.Service> services) {
-        int index = Math.floorMod(id * 0x9E3779B9, services.size());
+        int index = Math.floorMod(id * 0x9E3779B9, services.size() - 1);
         return services.get(index);
-        // TODO: when server is down
+    }
+
+    private static void replaceService(int index, List<JsonUtils.Service> services) throws IOException {
+        JsonUtils.Service failed = services.get(index);
+        JsonUtils.Service backup = services.get(services.size()-1);
+        if (!backup.isAlive) {
+            System.out.println(failed.type + " no backup available");
+            return;
+        }
+
+        services.set(index, backup);
+        services.set(services.size() - 1, failed);
+        HttpUtils.forwardRequestNoResponse(
+            failed.ip,
+            failed.port,
+            "/standby",
+            "POST",
+            ""
+        );
+        System.out.println(failed.type + " replaced");
+        if (failed.type.equals("UserService")) {
+            notifyOrder(index, "user");
+        } else if (failed.type.equals("ProductService")){
+            notifyOrder(index, "product");
+        }
+    }
+
+    private static void notifyOrder(int index, String type) throws IOException {
+        for (JsonUtils.Service orderService: orderServices) {
+            HttpUtils.forwardRequestNoResponse(
+                orderService.ip,
+                orderService.port,
+                "/standby/" + type + "/"+ index,
+                "POST",
+                ""
+            );
+        }
     }
 
     private static void loadServices(String configFileName) throws FileNotFoundException {

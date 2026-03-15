@@ -6,6 +6,8 @@ import com.sun.net.httpserver.HttpExchange;
 import java.io.FileReader;
 import java.io.IOException;
 import java.net.InetSocketAddress;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
@@ -26,7 +28,7 @@ import common.JsonUtils;
 public class ProductService {
     // service info
     final static int port = 14002;
-    final static int flushTime = 1;
+    final static int flushTime = 2;
     static HttpServer server;
     static ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
 
@@ -71,6 +73,7 @@ public class ProductService {
         server.createContext("/shutdown", new ShutdownHandler());
         server.createContext("/wipe", new WipeHandler());
         server.createContext("/reserve", new ReservePostHandler());
+        server.createContext("/standby", new StandbyHandler());
         server.start();
     }
 
@@ -262,6 +265,29 @@ public class ProductService {
         }
     }
 
+    static class StandbyHandler implements HttpHandler {
+        @Override
+        public void handle(HttpExchange exchange) throws IOException {
+            // non-POST requests
+            if (!"POST".equals(exchange.getRequestMethod())) {
+                HttpUtils.sendJsonResponse(exchange, 404, "{}");
+                return;
+            }
+            // flush to db 
+            try {
+                flushToDB();
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+
+            // clear cache
+            cache = new ConcurrentHashMap<>();
+            dirtyProducts = new ConcurrentHashMap<>();
+            deletedProducts = ConcurrentHashMap.newKeySet();
+            HttpUtils.sendJsonResponse(exchange, 200, "{}");
+        }
+    }
+
     private static Product getProduct(int id) {
         // get product from cache
         Product product = dirtyProducts.get(id);
@@ -450,7 +476,8 @@ public class ProductService {
         return new HttpResponse(401, "{}");
     }
 
-    private static void insertProductToDB(Product product) {
+    private static void insertProductsToDB(List<Product> products) {
+        if (products.isEmpty()) return;
         String sql = """
             INSERT INTO products (id, name, description, price, quantity) 
             VALUES (?, ?, ?, ?, ?) 
@@ -464,15 +491,24 @@ public class ProductService {
         Connection dbConnection = null;
         try {
             dbConnection = dbPool.take();
+            dbConnection.setAutoCommit(false);
             try(var statement = dbConnection.prepareStatement(sql)) {
-                statement.setInt(1, product.id);
-                statement.setString(2, product.productname);
-                statement.setString(3, product.description);
-                statement.setDouble(4, product.price);
-                statement.setInt(5, product.quantity);
-
-                statement.executeUpdate();
-            }
+                for (Product product:products) {
+                    statement.setInt(1, product.id);
+                    statement.setString(2, product.productname);
+                    statement.setString(3, product.description);
+                    statement.setDouble(4, product.price);
+                    statement.setInt(5, product.quantity);
+                    statement.addBatch();
+                }
+                statement.executeBatch();
+                dbConnection.commit();                
+        } catch (Exception e) {
+            dbConnection.rollback();
+            throw e;
+        } finally {
+            dbConnection.setAutoCommit(true);
+        }
 
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -501,15 +537,26 @@ public class ProductService {
         return json;
     }
 
-    private static void deleteProductFromDB(int id) {
+    private static void deleteProductsFromDB(List<Integer> ids) {
+        if (ids.isEmpty()) return;
         String sql = "DELETE FROM products WHERE id = ?";
         Connection dbConnection = null;
         try {
             dbConnection = dbPool.take();
+            dbConnection.setAutoCommit(false);
             try (var statement = dbConnection.prepareStatement(sql)) {
-                statement.setInt(1, id);
-                statement.executeUpdate();
-            }
+                for (Integer id:ids) {
+                    statement.setInt(1, id);
+                    statement.addBatch();
+                }
+                statement.executeBatch();
+                dbConnection.commit();
+        } catch (Exception e) {
+            dbConnection.rollback();
+            throw e;
+        } finally {
+            dbConnection.setAutoCommit(true);
+        }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             e.printStackTrace();
@@ -528,16 +575,20 @@ public class ProductService {
     }
 
     private static void flushToDB() {
+        List<Product> productsToInsert = new ArrayList<>();
+        List<Integer> productsToDelete = new ArrayList<>();
         for (Map.Entry<Integer, Product> entry : dirtyProducts.entrySet()) {
             Product product = entry.getValue();
-            insertProductToDB(product);
             dirtyProducts.remove(entry.getKey());
+            productsToInsert.add(product);
         }
 
         for (Integer id : Set.copyOf(deletedProducts)) {
-            deleteProductFromDB(id);
             deletedProducts.remove(id);
+            productsToDelete.add(id);
         }
+        insertProductsToDB(productsToInsert);
+        deleteProductsFromDB(productsToDelete);
     }
 
     private static void initDbPool() throws SQLException{

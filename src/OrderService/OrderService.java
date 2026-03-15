@@ -32,7 +32,7 @@ import common.JsonUtils;
 public class OrderService {
     // service info
     final static int port = 14003;
-    final static int flushTime = 1;
+    final static int flushTime = 2;
     static HttpServer server;
     static ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
 
@@ -89,6 +89,9 @@ public class OrderService {
         server.createContext("/livecheck", new LiveCheckHandler());
         // server.createContext("/shutdown", new ShutdownHandler());
         // server.createContext("/restart", new RestartHandler());
+        server.createContext("/standby", new StandbyHandler());
+        server.createContext("/standby/user", new StandbyUserHandler());
+        server.createContext("/standby/product", new StandbyProductHandler());
         server.start();
     }
 
@@ -184,6 +187,85 @@ public class OrderService {
             }
             HttpUtils.sendJsonResponse(exchange, 200, "{}");
         }
+    }
+
+    static class StandbyHandler implements HttpHandler {
+        @Override
+        public void handle(HttpExchange exchange) throws IOException {
+            // non-POST requests
+            if (!"POST".equals(exchange.getRequestMethod())) {
+                HttpUtils.sendJsonResponse(exchange, 404, "{}");
+                return;
+            }
+            // flush to db 
+            try {
+                flushToDB();
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+
+            // clear cache
+            dirtyOrders.clear();
+            purchases.clear();
+            HttpUtils.sendJsonResponse(exchange, 200, "{}");
+        }
+    }
+
+    static class StandbyUserHandler implements HttpHandler {
+        @Override
+        public void handle(HttpExchange exchange) throws IOException {
+            // non-POST requests
+            if (!"POST".equals(exchange.getRequestMethod())) {
+                HttpUtils.sendJsonResponse(exchange, 404, "{}");
+                return;
+            }
+
+            // parse id
+            Integer index;
+            String []tokens = exchange.getRequestURI().toString().split("/");
+            try {
+                index = Integer.parseInt(tokens[tokens.length-1]);
+            } catch (NumberFormatException e) {
+                HttpUtils.sendJsonResponse(exchange, 400, "{}");
+                return;
+            }
+
+            // repace service
+            replaceService(index, userServices);
+            HttpUtils.sendJsonResponse(exchange, 200, "{}");
+        }
+    }
+
+    static class StandbyProductHandler implements HttpHandler {
+        @Override
+        public void handle(HttpExchange exchange) throws IOException {
+            // non-POST requests
+            if (!"POST".equals(exchange.getRequestMethod())) {
+                HttpUtils.sendJsonResponse(exchange, 404, "{}");
+                return;
+            }
+
+            // parse id
+            Integer index;
+            String []tokens = exchange.getRequestURI().toString().split("/");
+            try {
+                index = Integer.parseInt(tokens[tokens.length-1]);
+            } catch (NumberFormatException e) {
+                HttpUtils.sendJsonResponse(exchange, 400, "{}");
+                return;
+            }
+
+            // repace service
+            replaceService(index, productServices);
+            HttpUtils.sendJsonResponse(exchange, 200, "{}");
+        }
+    }
+
+    private static void replaceService(int index, List<JsonUtils.Service> services) throws IOException {
+        JsonUtils.Service failed = services.get(index);
+        JsonUtils.Service backup = services.get(services.size()-1);
+        services.set(index, backup);
+        services.set(services.size() - 1, failed);
     }
 
     private static boolean checkUserExistence(int id) throws IOException{
@@ -372,7 +454,8 @@ public class OrderService {
             "/wipe", "POST", "");
     }
 
-    private static void insertOrderToDB(Order order){
+    private static void insertOrdersToDB(List<Order> orders){
+        if (orders.isEmpty()) return;
         String sql = """
             INSERT INTO orders (id, product_id, user_id, quantity) 
             VALUES (?, ?, ?, ?) 
@@ -385,12 +468,17 @@ public class OrderService {
         Connection dbConnection = null;
         try {
             dbConnection = dbPool.take();
+            dbConnection.setAutoCommit(false);
             try (var statement = dbConnection.prepareStatement(sql)) {
-                statement.setInt(1, order.id);
-                statement.setInt(2, order.product_id);
-                statement.setInt(3, order.user_id);
-                statement.setInt(4, order.quantity);
-                statement.executeUpdate();
+                for (Order order:orders) {
+                    statement.setInt(1, order.id);
+                    statement.setInt(2, order.product_id);
+                    statement.setInt(3, order.user_id);
+                    statement.setInt(4, order.quantity);
+                    statement.addBatch();
+                }
+                statement.executeBatch();
+                dbConnection.commit();
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -410,6 +498,8 @@ public class OrderService {
     }
 
     private static void flushToDB() {
+        List<Order> ordersToFlush = new ArrayList<>();
+
         for (Integer id : Set.copyOf(dirtyOrders.keySet())) {
             Order order = dirtyOrders.get(id);
             if (order == null) continue;
@@ -417,10 +507,12 @@ public class OrderService {
                 order = dirtyOrders.remove(id);
                 if (order != null) {
                     recordPurchase(order.user_id, order.product_id, order.quantity);
-                    insertOrderToDB(order);
+                    ordersToFlush.add(order);
                 }
             }
         }
+
+        insertOrdersToDB(ordersToFlush);
     }
 
     private static void loadServices(String configFileName) throws FileNotFoundException {
@@ -435,9 +527,8 @@ public class OrderService {
     }
 
     private static JsonUtils.Service selectService(int id, List<JsonUtils.Service> services) {
-        int index = Math.floorMod(id * 0x9E3779B9, services.size());
+        int index = Math.floorMod(id * 0x9E3779B9, services.size()-1);
         return services.get(index);
-        // TODO: when server is down
     }
 
     private static void initDbPool() throws SQLException{
